@@ -649,8 +649,7 @@ public class PlatformBuilderScreen extends AbstractContainerScreen<PlatformBuild
             g.fill(lx, ly + lsz - 2, lx + lsz, ly + lsz, 0xCC44AAAA);
         }
 
-        // Paste preview
-        if (clipboard != null && !clipboard.isEmpty() && isInGrid(mx, my)) {
+        if (mode == Mode.PASTE && clipboard != null && !clipboard.isEmpty() && isInGrid(mx, my)) {
             BlockPos hover = screenToGrid(mx, my);
             if (hover != null) {
                 for (var entry : clipboard.entrySet()) {

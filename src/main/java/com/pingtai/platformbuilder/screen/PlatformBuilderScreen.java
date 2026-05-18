@@ -661,10 +661,10 @@ public class PlatformBuilderScreen extends AbstractContainerScreen<PlatformBuild
                         g.fill(px, py, px + psz - 1, py + psz - 1,
                             col != null ? (col & 0x00FFFFFF) | 0x50000000 : 0x50448844);
                     }
-                    g.fill(px, py, px + psz, py + 1, 0x88FFFFFF);
-                    g.fill(px, py, px + 1, py + psz, 0x88FFFFFF);
-                    g.fill(px, py + psz - 1, px + psz, py + psz, 0x88FFFFFF);
-                    g.fill(px + psz - 1, py, px + psz, py + psz, 0x88FFFFFF);
+                    g.fill(px, py, px + psz, py + 1, 0xCCFFD700);
+                    g.fill(px, py, px + 1, py + psz, 0xCCFFD700);
+                    g.fill(px, py + psz - 1, px + psz, py + psz, 0xCCFFD700);
+                    g.fill(px + psz - 1, py, px + psz, py + psz, 0xCCFFD700);
                 }
             }
         }
@@ -721,7 +721,6 @@ public class PlatformBuilderScreen extends AbstractContainerScreen<PlatformBuild
             lastClickPos = screenToGrid((int) mx, (int) my);
             if (mode == Mode.PASTE && btn == 0) {
                 pasteClipboard();
-                mode = Mode.NORMAL;
                 return true;
             }
             if (btn == 0) {

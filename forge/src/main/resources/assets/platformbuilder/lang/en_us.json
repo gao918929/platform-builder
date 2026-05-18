@@ -1,0 +1,7 @@
+{
+  "itemGroup.platformbuilder": "Platform Builder",
+  "block.platformbuilder.platform_builder": "Platform Builder",
+  "gui.platformbuilder.build": "Start Building",
+  "item.platformbuilder.pig_certificate": "Pig Certificate",
+  "item.platformbuilder.pig_certificate.tooltip": "§ePlace in the machine for infinite concrete of all types!"
+}

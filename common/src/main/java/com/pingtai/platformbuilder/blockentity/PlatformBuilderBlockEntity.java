@@ -1,9 +1,11 @@
 package com.pingtai.platformbuilder.blockentity;
 
-import com.pingtai.platformbuilder.block.ModItems;
+import com.pingtai.platformbuilder.PlatformServices;
 import com.pingtai.platformbuilder.screen.PlatformBuilderMenu;
 import net.minecraft.core.BlockPos;
 import net.minecraft.core.Direction;
+import net.minecraft.core.registries.BuiltInRegistries;
+import net.minecraft.core.HolderLookup;
 import net.minecraft.nbt.CompoundTag;
 import net.minecraft.nbt.ListTag;
 import net.minecraft.nbt.Tag;
@@ -13,6 +15,7 @@ import net.minecraft.network.protocol.game.ClientGamePacketListener;
 import net.minecraft.network.protocol.game.ClientboundBlockEntityDataPacket;
 import net.minecraft.resources.ResourceLocation;
 import net.minecraft.world.MenuProvider;
+import net.minecraft.world.SimpleContainer;
 import net.minecraft.world.entity.player.Inventory;
 import net.minecraft.world.entity.player.Player;
 import net.minecraft.world.inventory.AbstractContainerMenu;
@@ -22,45 +25,39 @@ import net.minecraft.world.item.ItemStack;
 import net.minecraft.world.level.Level;
 import net.minecraft.world.level.block.Block;
 import net.minecraft.world.level.block.entity.BlockEntity;
+import net.minecraft.world.level.block.entity.BlockEntityType;
 import net.minecraft.world.level.block.state.BlockState;
-import net.minecraftforge.common.capabilities.Capability;
-import net.minecraftforge.common.capabilities.ForgeCapabilities;
-import net.minecraftforge.common.util.LazyOptional;
-import net.minecraftforge.items.ItemStackHandler;
-import net.minecraftforge.registries.ForgeRegistries;
-import org.jetbrains.annotations.NotNull;
 import org.jetbrains.annotations.Nullable;
 
 import java.util.*;
+import java.util.function.Supplier;
 
 public class PlatformBuilderBlockEntity extends BlockEntity implements MenuProvider {
 
     public static final int INVENTORY_SIZE = 27;
+
+    /** Set by the platform module before block registration. */
+    public static Supplier<BlockEntityType<PlatformBuilderBlockEntity>> TYPE;
+
     private int buildSpeed = 50;
-    private int buildOffsetY = 0; // vertical offset from machine position
+    private int buildOffsetY = 0;
 
-    private final ItemStackHandler itemHandler = new ItemStackHandler(INVENTORY_SIZE) {
-        @Override
-        protected void onContentsChanged(int slot) {
-            setChanged();
-            if (level != null && !level.isClientSide) {
-                level.sendBlockUpdated(worldPosition, getBlockState(), getBlockState(), Block.UPDATE_ALL);
-            }
-        }
-    };
+    private final SimpleContainer inventory = new SimpleContainer(INVENTORY_SIZE);
 
-    private LazyOptional<ItemStackHandler> lazyItemHandler = LazyOptional.of(() -> itemHandler);
-
-    // Design data: relative position -> block registry name (e.g. "minecraft:stone")
     private final Map<BlockPos, String> design = new LinkedHashMap<>();
 
-    // Build state
     private boolean isBuilding = false;
     private final Queue<Map.Entry<BlockPos, String>> buildQueue = new ArrayDeque<>();
     private int buildCooldown = 0;
 
+    /** Used by {@link BlockEntityType.Builder#of}. */
     public PlatformBuilderBlockEntity(BlockPos pos, BlockState state) {
-        super(ModBlockEntities.PLATFORM_BUILDER_BE.get(), pos, state);
+        super(TYPE.get(), pos, state);
+    }
+
+    /** Used by {@link com.pingtai.platformbuilder.block.PlatformBuilderBlock#newBlockEntity}. */
+    public PlatformBuilderBlockEntity(BlockEntityType<?> type, BlockPos pos, BlockState state) {
+        super(type, pos, state);
     }
 
     // === Design management ===
@@ -108,7 +105,6 @@ public class PlatformBuilderBlockEntity extends BlockEntity implements MenuProvi
         if (!canStartBuilding()) return;
 
         buildQueue.clear();
-        // Sort by distance for logical build order
         design.entrySet().stream()
                 .sorted(Comparator.comparingInt(e -> e.getKey().distManhattan(BlockPos.ZERO)))
                 .forEach(buildQueue::add);
@@ -149,7 +145,7 @@ public class PlatformBuilderBlockEntity extends BlockEntity implements MenuProvi
             if (be.tryPlaceBlock(level, worldPos, entry.getValue())) {
                 placed++;
             } else {
-                be.buildQueue.offer(entry); // move to end, retry later
+                be.buildQueue.offer(entry);
                 skipped++;
             }
         }
@@ -164,7 +160,7 @@ public class PlatformBuilderBlockEntity extends BlockEntity implements MenuProvi
         BlockState existingState = level.getBlockState(targetPos);
         if (!existingState.isAir() && !existingState.canBeReplaced()) return false;
 
-        Block block = ForgeRegistries.BLOCKS.getValue(new ResourceLocation(blockId));
+        Block block = BuiltInRegistries.BLOCK.get(ResourceLocation.parse(blockId));
         if (block == null) return false;
 
         // Pig Certificate: infinite concrete without consuming materials
@@ -175,16 +171,19 @@ public class PlatformBuilderBlockEntity extends BlockEntity implements MenuProvi
         // Try internal inventory first
         int slot = findMaterialSlot(block);
         if (slot >= 0) {
-            ItemStack simulated = itemHandler.extractItem(slot, 1, true);
-            if (simulated.getCount() >= 1) {
+            ItemStack stack = inventory.getItem(slot);
+            if (stack.getCount() >= 1) {
                 boolean placed = level.setBlock(targetPos, block.defaultBlockState(), Block.UPDATE_ALL);
-                if (placed) itemHandler.extractItem(slot, 1, false);
+                if (placed) {
+                    stack.shrink(1);
+                    if (stack.isEmpty()) inventory.setItem(slot, ItemStack.EMPTY);
+                }
                 return placed;
             }
         }
 
-        // Fallback: try adjacent inventories (chests, barrels, hoppers, etc.)
-        if (extractFromAdjacent(block)) {
+        // Fallback: try adjacent inventories
+        if (PlatformServices.PLATFORM.extractFromAdjacent(level, worldPosition, block)) {
             return level.setBlock(targetPos, block.defaultBlockState(), Block.UPDATE_ALL);
         }
 
@@ -192,9 +191,9 @@ public class PlatformBuilderBlockEntity extends BlockEntity implements MenuProvi
     }
 
     public boolean hasPigCertificate() {
-        Item certItem = ModItems.PIG_CERTIFICATE.get();
+        Item certItem = BuiltInRegistries.ITEM.get(ResourceLocation.fromNamespaceAndPath("platformbuilder", "pig_certificate"));
         for (int i = 0; i < INVENTORY_SIZE; i++) {
-            if (itemHandler.getStackInSlot(i).is(certItem)) {
+            if (inventory.getItem(i).is(certItem)) {
                 return true;
             }
         }
@@ -221,7 +220,7 @@ public class PlatformBuilderBlockEntity extends BlockEntity implements MenuProvi
 
     private int findMaterialSlot(Block block) {
         for (int i = 0; i < INVENTORY_SIZE; i++) {
-            ItemStack stack = itemHandler.getStackInSlot(i);
+            ItemStack stack = inventory.getItem(i);
             if (!stack.isEmpty() && stack.getItem() instanceof BlockItem blockItem) {
                 if (blockItem.getBlock() == block) return i;
             }
@@ -229,40 +228,28 @@ public class PlatformBuilderBlockEntity extends BlockEntity implements MenuProvi
         return -1;
     }
 
-    /** Extract one of the given block from any adjacent inventory */
-    private boolean extractFromAdjacent(Block block) {
-        if (level == null) return false;
-        for (Direction dir : Direction.values()) {
-            BlockEntity adjBe = level.getBlockEntity(worldPosition.relative(dir));
-            if (adjBe == null) continue;
-            boolean[] found = {false};
-            adjBe.getCapability(ForgeCapabilities.ITEM_HANDLER, dir.getOpposite()).ifPresent(adjInv -> {
-                for (int i = 0; i < adjInv.getSlots() && !found[0]; i++) {
-                    ItemStack stack = adjInv.getStackInSlot(i);
-                    if (!stack.isEmpty() && stack.getItem() instanceof BlockItem bi
-                            && bi.getBlock() == block) {
-                        ItemStack extracted = adjInv.extractItem(i, 1, false);
-                        if (!extracted.isEmpty()) found[0] = true;
-                    }
-                }
-            });
-            if (found[0]) return true;
-        }
-        return false;
-    }
-
     // === Inventory ===
 
-    public ItemStackHandler getItemHandler() {
-        return itemHandler;
+    public SimpleContainer getInventory() {
+        return inventory;
     }
 
     // === NBT ===
 
     @Override
-    protected void saveAdditional(CompoundTag tag) {
-        super.saveAdditional(tag);
-        tag.put("inventory", itemHandler.serializeNBT());
+    protected void saveAdditional(CompoundTag tag, HolderLookup.Provider registries) {
+        super.saveAdditional(tag, registries);
+        ListTag invList = new ListTag();
+        for (int i = 0; i < INVENTORY_SIZE; i++) {
+            ItemStack stack = inventory.getItem(i);
+            if (!stack.isEmpty()) {
+                CompoundTag slotTag = new CompoundTag();
+                slotTag.putInt("Slot", i);
+                slotTag.put("item", stack.save(registries));
+                invList.add(slotTag);
+            }
+        }
+        tag.put("inventory", invList);
         tag.putBoolean("isBuilding", isBuilding);
         tag.putInt("buildSpeed", buildSpeed);
         tag.putInt("buildOffsetY", buildOffsetY);
@@ -270,9 +257,16 @@ public class PlatformBuilderBlockEntity extends BlockEntity implements MenuProvi
     }
 
     @Override
-    public void load(CompoundTag tag) {
-        super.load(tag);
-        itemHandler.deserializeNBT(tag.getCompound("inventory"));
+    protected void loadAdditional(CompoundTag tag, HolderLookup.Provider registries) {
+        super.loadAdditional(tag, registries);
+        inventory.clearContent();
+        ListTag invList = tag.getList("inventory", Tag.TAG_COMPOUND);
+        for (int i = 0; i < invList.size(); i++) {
+            CompoundTag slotTag = invList.getCompound(i);
+            int slot = slotTag.getInt("Slot");
+            ItemStack.parse(registries, slotTag.getCompound("item"))
+                    .ifPresent(stack -> inventory.setItem(slot, stack));
+        }
         isBuilding = tag.getBoolean("isBuilding");
         buildSpeed = tag.contains("buildSpeed") ? tag.getInt("buildSpeed") : 50;
         buildOffsetY = tag.contains("buildOffsetY") ? tag.getInt("buildOffsetY") : 0;
@@ -316,8 +310,8 @@ public class PlatformBuilderBlockEntity extends BlockEntity implements MenuProvi
     }
 
     @Override
-    public CompoundTag getUpdateTag() {
-        CompoundTag tag = super.getUpdateTag();
+    public CompoundTag getUpdateTag(HolderLookup.Provider registries) {
+        CompoundTag tag = super.getUpdateTag(registries);
         saveDesign(tag);
         tag.putInt("buildSpeed", buildSpeed);
         tag.putInt("buildOffsetY", buildOffsetY);
@@ -325,33 +319,11 @@ public class PlatformBuilderBlockEntity extends BlockEntity implements MenuProvi
     }
 
     @Override
-    public void handleUpdateTag(CompoundTag tag) {
-        super.handleUpdateTag(tag);
+    public void handleUpdateTag(CompoundTag tag, HolderLookup.Provider registries) {
+        super.handleUpdateTag(tag, registries);
         loadDesign(tag);
         buildSpeed = tag.contains("buildSpeed") ? tag.getInt("buildSpeed") : 50;
         buildOffsetY = tag.contains("buildOffsetY") ? tag.getInt("buildOffsetY") : 0;
-    }
-
-    // === Capability ===
-
-    @Override
-    public @NotNull <T> LazyOptional<T> getCapability(@NotNull Capability<T> cap, @Nullable Direction side) {
-        if (cap == ForgeCapabilities.ITEM_HANDLER) {
-            return lazyItemHandler.cast();
-        }
-        return super.getCapability(cap, side);
-    }
-
-    @Override
-    public void invalidateCaps() {
-        super.invalidateCaps();
-        lazyItemHandler.invalidate();
-    }
-
-    @Override
-    public void reviveCaps() {
-        super.reviveCaps();
-        lazyItemHandler = LazyOptional.of(() -> itemHandler);
     }
 
     // === MenuProvider ===

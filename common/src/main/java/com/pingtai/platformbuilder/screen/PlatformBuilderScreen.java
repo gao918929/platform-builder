@@ -3,26 +3,25 @@ package com.pingtai.platformbuilder.screen;
 import com.google.gson.JsonObject;
 import com.google.gson.JsonParser;
 import com.mojang.blaze3d.systems.RenderSystem;
-import com.pingtai.platformbuilder.network.ModMessages;
-import com.pingtai.platformbuilder.network.BuildPlatformPacket;
-import com.pingtai.platformbuilder.network.ExtractAllPacket;
-import com.pingtai.platformbuilder.network.QuickLoadPacket;
-import com.pingtai.platformbuilder.network.SetOffsetPacket;
-import com.pingtai.platformbuilder.network.SetSpeedPacket;
-import com.pingtai.platformbuilder.network.SyncDesignPacket;
+import com.pingtai.platformbuilder.PlatformServices;
+import com.pingtai.platformbuilder.blockentity.PlatformBuilderBlockEntity;
 import net.minecraft.client.Minecraft;
 import net.minecraft.client.gui.GuiGraphics;
 import net.minecraft.client.gui.components.Button;
 import net.minecraft.client.gui.screens.inventory.AbstractContainerScreen;
+import net.minecraft.client.renderer.texture.TextureAtlas;
+import net.minecraft.client.renderer.texture.TextureAtlasSprite;
 import net.minecraft.core.BlockPos;
+import net.minecraft.core.Direction;
+import net.minecraft.core.registries.BuiltInRegistries;
 import net.minecraft.network.chat.Component;
 import net.minecraft.resources.ResourceLocation;
+import net.minecraft.util.RandomSource;
 import net.minecraft.world.entity.player.Inventory;
 import net.minecraft.world.inventory.Slot;
 import net.minecraft.world.item.BlockItem;
 import net.minecraft.world.item.ItemStack;
 import net.minecraft.world.level.block.Block;
-import net.minecraftforge.registries.ForgeRegistries;
 
 import java.net.URI;
 import java.net.http.HttpClient;
@@ -51,6 +50,7 @@ public class PlatformBuilderScreen extends AbstractContainerScreen<PlatformBuild
     private static final String[] PATTERN_NAMES = {"棋盘格", "横条纹", "竖条纹", "边框", "L↖", "L↗", "L↙", "L↘", "随机"};
     private int patternIdx;
     private Button offsetResetBtn;
+    private Button scanBtn, copyBtn, pasteBtn, genBtn, aiBtn, buildBtn;
     private boolean showPatternPopup;
     private int selectedPattern = -1;
 
@@ -60,13 +60,12 @@ public class PlatformBuilderScreen extends AbstractContainerScreen<PlatformBuild
     private static final int DESIGN_H = 220;
     private static final int INVENTORY_H = 188;
 
-    // State
     private boolean inventoryMode;
 
-    // Design-mode state
     private Tool tool = Tool.BRUSH;
     private String selectedMaterial;
     private final List<String> materials = new ArrayList<>();
+    private final Map<String, TextureAtlasSprite> matSprites = new LinkedHashMap<>();
     private final Map<String, ItemStack> matIcons = new LinkedHashMap<>();
     private final Map<String, Integer> matColors = new LinkedHashMap<>();
     private int matScroll;
@@ -81,10 +80,10 @@ public class PlatformBuilderScreen extends AbstractContainerScreen<PlatformBuild
     private int lastScannedOffsetY = Integer.MIN_VALUE;
     private Map<BlockPos, String> clipboard;
     private BlockPos clipboardOrigin;
+    private int clipCenterX, clipCenterZ;
     private final Deque<Map<BlockPos, String>> undoStack = new ArrayDeque<>();
     private static final int MAX_UNDO = 50;
 
-    // Toolbar hit areas
     private final int[] toolBtnX = new int[Tool.values().length];
     private int undoCX, clearCX, chunkCX, matStartX;
     private int tby;
@@ -95,33 +94,28 @@ public class PlatformBuilderScreen extends AbstractContainerScreen<PlatformBuild
         imageHeight = DESIGN_H;
     }
 
-    // ==================== INIT ====================
-
     @Override
     protected void init() {
         imageHeight = inventoryMode ? INVENTORY_H : DESIGN_H;
         super.init();
 
-        if (menu.blockEntity.getDesign() != null)
-            design.putAll(menu.blockEntity.getDesign());
+        if (design.isEmpty() && getBE() != null && getBE().getDesign() != null) {
+            design.putAll(getBE().getDesign());
+        }
 
         if (inventoryMode) {
-            repositionSlotsForInventory();
             buildInventoryWidgets();
         } else {
-            hideSlots();
             buildDesignWidgets();
             refreshMaterials();
         }
     }
 
     private void buildDesignWidgets() {
-        // Mode toggle
         addRenderableWidget(Button.builder(
                 Component.literal("放入"), b -> switchToInventoryMode()
         ).pos(leftPos + 8, topPos + TB_Y + 2).size(36, 18).build());
 
-        // Speed control
         int spdY = topPos + 198;
         addRenderableWidget(Button.builder(
                 Component.literal("-"), b -> changeSpeed(-10)
@@ -131,20 +125,18 @@ public class PlatformBuilderScreen extends AbstractContainerScreen<PlatformBuild
                 Component.literal("+"), b -> changeSpeed(10)
         ).pos(leftPos + 23, spdY).size(14, 20).build());
 
-        // Y-offset control
         addRenderableWidget(Button.builder(
                 Component.literal("-"), b -> changeOffset(-1)
         ).pos(leftPos + 90, spdY).size(14, 20).build());
 
         offsetResetBtn = addRenderableWidget(Button.builder(
-                Component.literal(String.valueOf(menu.blockEntity.getBuildOffsetY())), b -> changeOffsetTo(0)
+                Component.literal(String.valueOf(getBuildOffsetY())), b -> changeOffsetTo(0)
         ).pos(leftPos + 105, spdY).size(14, 20).build());
 
         addRenderableWidget(Button.builder(
                 Component.literal("+"), b -> changeOffset(1)
         ).pos(leftPos + 120, spdY).size(14, 20).build());
 
-        // Scan, copy, paste, generate, AI buttons
         addRenderableWidget(Button.builder(
                 Component.literal("扫描"), b -> scanExistingBlocks()
         ).pos(leftPos + 142, spdY).size(26, 20).build());
@@ -165,63 +157,59 @@ public class PlatformBuilderScreen extends AbstractContainerScreen<PlatformBuild
                 Component.literal("AI"), b -> aiGenerate()
         ).pos(leftPos + 254, spdY).size(24, 20).build());
 
-        // Build button
         addRenderableWidget(Button.builder(
                 Component.translatable("gui.platformbuilder.build"), b -> {
                     sendDesign();
-                    ModMessages.sendToServer(new BuildPlatformPacket(menu.blockEntity.getBlockPos()));
+                    PlatformServices.PLATFORM.sendBuildPacket(getBEPos());
                 }
         ).pos(leftPos + 282, spdY).size(48, 20).build());
     }
 
     private void changeSpeed(int delta) {
-        int newSpeed = menu.blockEntity.getBuildSpeed() + delta;
-        menu.blockEntity.setBuildSpeed(newSpeed);
-        ModMessages.sendToServer(new SetSpeedPacket(menu.blockEntity.getBlockPos(), newSpeed));
+        int newSpeed = getBuildSpeed() + delta;
+        setBuildSpeed(newSpeed);
+        PlatformServices.PLATFORM.sendSetSpeedPacket(getBEPos(), newSpeed);
     }
 
     private void changeOffset(int delta) {
-        int newOff = menu.blockEntity.getBuildOffsetY() + delta;
-        menu.blockEntity.setBuildOffsetY(newOff);
-        ModMessages.sendToServer(new SetOffsetPacket(menu.blockEntity.getBlockPos(), newOff));
+        int newOff = getBuildOffsetY() + delta;
+        setBuildOffsetY(newOff);
+        PlatformServices.PLATFORM.sendSetOffsetPacket(getBEPos(), newOff);
         if (offsetResetBtn != null) offsetResetBtn.setMessage(Component.literal(String.valueOf(newOff)));
     }
 
     private void changeOffsetTo(int value) {
-        menu.blockEntity.setBuildOffsetY(value);
-        ModMessages.sendToServer(new SetOffsetPacket(menu.blockEntity.getBlockPos(), value));
+        setBuildOffsetY(value);
+        PlatformServices.PLATFORM.sendSetOffsetPacket(getBEPos(), value);
         if (offsetResetBtn != null) offsetResetBtn.setMessage(Component.literal(String.valueOf(value)));
     }
 
     private void buildInventoryWidgets() {
         int rowY = topPos + 4;
-        // Mode toggle
         addRenderableWidget(Button.builder(
                 Component.literal("设计"), b -> switchToDesignMode()
         ).pos(leftPos + 8, rowY).size(36, 18).build());
 
-        // Quick load
         addRenderableWidget(Button.builder(
                 Component.literal("→ 放入全部"), b ->
-                ModMessages.sendToServer(new QuickLoadPacket(menu.blockEntity.getBlockPos()))
+                PlatformServices.PLATFORM.sendQuickLoadPacket(getBEPos())
         ).pos(leftPos + 50, rowY).size(80, 18).build());
 
-        // Extract all
         addRenderableWidget(Button.builder(
                 Component.literal("← 取出全部"), b ->
-                ModMessages.sendToServer(new ExtractAllPacket(menu.blockEntity.getBlockPos()))
+                PlatformServices.PLATFORM.sendExtractAllPacket(getBEPos())
         ).pos(leftPos + 136, rowY).size(80, 18).build());
 
-        // Build button
         addRenderableWidget(Button.builder(
                 Component.translatable("gui.platformbuilder.build"), b -> {
                     sendDesign();
-                    ModMessages.sendToServer(new BuildPlatformPacket(menu.blockEntity.getBlockPos()));
+                    PlatformServices.PLATFORM.sendBuildPacket(getBEPos());
                 }
         ).pos(leftPos + 222, rowY).size(100, 18).build());
     }
 
     private void switchToInventoryMode() {
+        sendDesign(); // 同步当前设计到服务器，防止丢失修改
         inventoryMode = true;
         resetWidgets();
         init();
@@ -238,38 +226,65 @@ public class PlatformBuilderScreen extends AbstractContainerScreen<PlatformBuild
         this.children().clear();
     }
 
-    private void repositionSlotsForInventory() {
-        // Machine slots (0-26)
-        for (int row = 0; row < 3; row++) {
-            for (int col = 0; col < 9; col++) {
-                Slot slot = menu.slots.get(col + row * 9);
-                slot.x = 8 + col * 18;
-                slot.y = PlatformBuilderMenu.MACHINE_Y + row * 18;
+    private void copySelection() {
+        clipboard = null;
+        clipboardOrigin = null;
+        if (tool == Tool.RECT && toolStart != null && toolEnd != null) {
+            int mnX = Math.min(toolStart.getX(), toolEnd.getX());
+            int mxX = Math.max(toolStart.getX(), toolEnd.getX());
+            int mnZ = Math.min(toolStart.getZ(), toolEnd.getZ());
+            int mxZ = Math.max(toolStart.getZ(), toolEnd.getZ());
+            clipboard = new LinkedHashMap<>();
+            clipboardOrigin = new BlockPos(mnX, 0, mnZ);
+            for (int x = mnX; x <= mxX; x++) {
+                for (int z = mnZ; z <= mxZ; z++) {
+                    BlockPos p = new BlockPos(x, 0, z);
+                    String mat = design.get(p);
+                    if (mat == null) mat = existingBlocks.get(p);
+                    if (mat != null)
+                        clipboard.put(new BlockPos(x - mnX, 0, z - mnZ), mat);
+                }
             }
-        }
-        // Player main (27-53)
-        for (int row = 0; row < 3; row++) {
-            for (int col = 0; col < 9; col++) {
-                Slot slot = menu.slots.get(27 + col + row * 9);
-                slot.x = 8 + col * 18;
-                slot.y = PlatformBuilderMenu.PLAYER_MAIN_Y + row * 18;
-            }
-        }
-        // Hotbar (54-62)
-        for (int col = 0; col < 9; col++) {
-            Slot slot = menu.slots.get(54 + col);
-            slot.x = 8 + col * 18;
-            slot.y = PlatformBuilderMenu.PLAYER_HOTBAR_Y;
+            clipCenterX = (mxX - mnX) / 2;
+            clipCenterZ = (mxZ - mnZ) / 2;
         }
     }
 
-    private void hideSlots() {
-        for (Slot slot : menu.slots) {
-            slot.y = 999;
+    private void pasteClipboard() {
+        if (clipboard == null || clipboard.isEmpty()) return;
+        BlockPos anchor = toolStart != null ? toolStart : lastClickPos;
+        if (anchor == null) return;
+        saveUndo();
+        for (var entry : clipboard.entrySet()) {
+            BlockPos target = anchor.offset(entry.getKey().getX() - clipCenterX, 0, entry.getKey().getZ() - clipCenterZ);
+            if (!design.containsKey(target))
+                design.put(target, entry.getValue());
         }
     }
 
-    // ==================== BG RENDER ====================
+    private void scanExistingBlocks() {
+        existingBlocks.clear();
+        if (minecraft == null || minecraft.level == null || getBE() == null) return;
+
+        BlockPos machinePos = getBEPos();
+        int offsetY = getBuildOffsetY();
+        int scanY = machinePos.getY() + offsetY;
+        lastScannedOffsetY = offsetY;
+
+        var level = minecraft.level;
+        int range = 48;
+        for (int dx = -range; dx <= range; dx++) {
+            for (int dz = -range; dz <= range; dz++) {
+                var state = level.getBlockState(new BlockPos(machinePos.getX() + dx, scanY, machinePos.getZ() + dz));
+                if (!state.isAir()) {
+                    var id = BuiltInRegistries.BLOCK.getKey(state.getBlock());
+                    if (id != null) {
+                        existingBlocks.put(new BlockPos(dx, 0, dz), id.toString());
+                    }
+                }
+            }
+        }
+    }
 
     @Override
     protected void renderBg(GuiGraphics g, float pt, int mx, int my) {
@@ -287,11 +302,9 @@ public class PlatformBuilderScreen extends AbstractContainerScreen<PlatformBuild
     private void renderDesignBg(GuiGraphics g, int mx, int my) {
         tby = topPos + TB_Y;
 
-        // Toolbar bg (tools only, no materials)
         g.fill(leftPos + 46, tby - 2, leftPos + imageWidth - 4, tby + TB_H + 2, 0x80222222);
         hline(g, leftPos + 46, leftPos + imageWidth - 4, tby + TB_H + 3, 0xFF555555);
 
-        // Grid bg
         int gy = topPos + GRID_Y;
         g.fill(leftPos + GRID_X - 1, gy - 1, leftPos + GRID_X + GRID_W + 1, gy + GRID_H + 1, 0xFF222222);
         g.fill(leftPos + GRID_X, gy, leftPos + GRID_X + GRID_W, gy + GRID_H, 0xFFD4CFC9);
@@ -302,12 +315,10 @@ public class PlatformBuilderScreen extends AbstractContainerScreen<PlatformBuild
         renderGrid(g, mx, my);
         g.disableScissor();
 
-        // Material palette below grid
         renderMaterialPalette(g, mx, my);
 
-        // Speed & offset display
-        int spd = menu.blockEntity.getBuildSpeed();
-        int off = menu.blockEntity.getBuildOffsetY();
+        int spd = getBuildSpeed();
+        int off = getBuildOffsetY();
         g.drawString(font, Component.literal("速度:" + spd), leftPos + 40, topPos + 200, 0xFFAAAAAA, false);
         g.drawString(font, Component.literal("Y:" + (off >= 0 ? "+" : "") + off),
                 leftPos + 136, topPos + 200, 0xFFAAAAAA, false);
@@ -321,11 +332,9 @@ public class PlatformBuilderScreen extends AbstractContainerScreen<PlatformBuild
         if (matScroll > maxScroll) matScroll = maxScroll;
         if (matScroll < 0) matScroll = 0;
 
-        // Label
         g.drawString(font, Component.literal("材料"), x, palY, 0xFFAAAAAA, false);
         x += 24;
 
-        // Scroll left arrow
         if (matScroll > 0) {
             g.fill(x, palY, x + 10, palY + 18, 0x80555555);
             g.drawString(font, Component.literal("<"), x + 2, palY + 5, 0xFFFFFFFF, false);
@@ -333,7 +342,6 @@ public class PlatformBuilderScreen extends AbstractContainerScreen<PlatformBuild
         }
         matStartX = x;
 
-        // Material icons
         for (int i = 0; i < 12 && i + matScroll < materials.size(); i++) {
             String mat = materials.get(i + matScroll);
             boolean sel = mat.equals(selectedMaterial);
@@ -343,7 +351,6 @@ public class PlatformBuilderScreen extends AbstractContainerScreen<PlatformBuild
             x += 22;
         }
 
-        // Scroll right arrow
         if (matScroll < maxScroll) {
             g.fill(x, palY, x + 10, palY + 18, 0x80555555);
             g.drawString(font, Component.literal(">"), x + 2, palY + 5, 0xFFFFFFFF, false);
@@ -351,14 +358,12 @@ public class PlatformBuilderScreen extends AbstractContainerScreen<PlatformBuild
     }
 
     private void renderInventoryBg(GuiGraphics g) {
-        // Machine inventory section
         int machineTop = topPos + 24;
         int machineBottom = topPos + 90;
         g.fill(leftPos + 6, machineTop, leftPos + imageWidth - 6, machineBottom, 0x80181818);
         hline(g, leftPos + 6, leftPos + imageWidth - 6, machineBottom, 0xFF555555);
         g.drawString(font, Component.literal("材料库存"), leftPos + 8, machineTop + 2, 0xFFAAAAAA, false);
 
-        // Player inventory section
         int playerTop = topPos + 92;
         int playerBottom = topPos + 184;
         g.fill(leftPos + 6, playerTop, leftPos + imageWidth - 6, playerBottom, 0x80181818);
@@ -369,17 +374,25 @@ public class PlatformBuilderScreen extends AbstractContainerScreen<PlatformBuild
     @Override
     public void render(GuiGraphics g, int mx, int my, float pt) {
         if (!inventoryMode) refreshMaterials();
-        renderBackground(g);
 
-        if (!inventoryMode) {
-            g.enableScissor(leftPos, topPos, leftPos + imageWidth, topPos + imageHeight);
-        }
-        super.render(g, mx, my, pt);
-        if (!inventoryMode) {
-            g.disableScissor();
+        if (inventoryMode) {
+            super.render(g, mx, my, pt);
+            return;
         }
 
-        if (!inventoryMode && isInGrid(mx, my) && tool != Tool.RECT) {
+        renderBackground(g, mx, my, pt);
+        renderBg(g, pt, mx, my);
+
+        for (var r : this.renderables)
+            r.render(g, mx, my, pt);
+
+        if (!this.menu.getCarried().isEmpty()) {
+            ItemStack cs = this.menu.getCarried();
+            g.renderItem(cs, mx - 8, my - 8);
+            g.renderItemDecorations(this.font, cs, mx - 8, my - 8);
+        }
+
+        if (isInGrid(mx, my) && tool != Tool.RECT) {
             BlockPos p = screenToGrid(mx, my);
             if (p != null) {
                 String dMat = design.get(p);
@@ -396,7 +409,7 @@ public class PlatformBuilderScreen extends AbstractContainerScreen<PlatformBuild
             }
         }
 
-        if (!inventoryMode && mode != Mode.NORMAL)
+        if (mode != Mode.NORMAL)
             g.drawString(font, Component.literal(mode == Mode.COPY ? "复制模式(拖拽框选)" : "粘贴模式(点击放置, Esc取消)"),
                 leftPos + 8, topPos + imageHeight - 12, 0xFFFFFF88, false);
 
@@ -405,8 +418,6 @@ public class PlatformBuilderScreen extends AbstractContainerScreen<PlatformBuild
 
     @Override
     protected void renderLabels(GuiGraphics g, int mx, int my) {}
-
-    // ==================== TOOLBAR (design mode only) ====================
 
     private void renderToolbar(GuiGraphics g) {
         int x = leftPos + 52;
@@ -446,8 +457,6 @@ public class PlatformBuilderScreen extends AbstractContainerScreen<PlatformBuild
         g.drawCenteredString(font, Component.literal(text), x + BTN_W / 2, y + BTN_H / 2 - 4, fg);
     }
 
-    // ==================== GRID (design mode only) ====================
-
     private void renderGrid(GuiGraphics g, int mx, int my) {
         float es = 16f * zoom;
         int cx = leftPos + GRID_X + GRID_W / 2 + (int) panX;
@@ -458,7 +467,7 @@ public class PlatformBuilderScreen extends AbstractContainerScreen<PlatformBuild
         int sZ = (int) Math.floor((topPos + GRID_Y - cy) / es) - 1;
         int eZ = (int) Math.ceil((topPos + GRID_Y + GRID_H - cy) / es) + 1;
 
-        BlockPos wp = menu.blockEntity.getBlockPos();
+        BlockPos wp = getBEPos();
         int wx = wp.getX(), wz = wp.getZ();
 
         int rmx = 0, rMx = -1, rmz = 0, rMz = -1;
@@ -487,14 +496,10 @@ public class PlatformBuilderScreen extends AbstractContainerScreen<PlatformBuild
                 String mat = design.get(key);
 
                 if (mat != null) {
-                    if (es >= 8) {
-                        ItemStack icon = matIcons.get(mat);
-                        if (icon != null)
-                            g.renderItem(icon, sx + (sz - 16) / 2, sy + (sz - 16) / 2);
-                        else {
-                            Integer col = matColors.get(mat);
-                            g.fill(sx, sy, sx + sz - 1, sy + sz - 1, col != null ? col : 0xFF44AA44);
-                        }
+                    TextureAtlasSprite sprite = matSprites.get(mat);
+                    if (sprite != null && sz >= 2) {
+                        RenderSystem.setShaderTexture(0, TextureAtlas.LOCATION_BLOCKS);
+                        g.blit(sx, sy, 0, sz, sz, sprite);
                     } else {
                         Integer col = matColors.get(mat);
                         g.fill(sx, sy, sx + sz - 1, sy + sz - 1, col != null ? col : 0xFF44AA44);
@@ -504,7 +509,7 @@ public class PlatformBuilderScreen extends AbstractContainerScreen<PlatformBuild
                     if (existingMat != null) {
                         Integer col = matColors.get(existingMat);
                         if (col == null) {
-                            Block block = ForgeRegistries.BLOCKS.getValue(new ResourceLocation(existingMat));
+                            Block block = BuiltInRegistries.BLOCK.get(ResourceLocation.parse(existingMat));
                             if (block != null) {
                                 col = 0xFF000000 | block.defaultMapColor().col;
                                 matColors.put(existingMat, col);
@@ -568,19 +573,17 @@ public class PlatformBuilderScreen extends AbstractContainerScreen<PlatformBuild
             g.fill(cx + 4, cy + oz / 2 - 1, cx + oz - 4, cy + oz / 2 + 2, 0x90FF4444);
         }
 
-        ItemStack previewIcon = (selectedMaterial != null) ? matIcons.get(selectedMaterial) : null;
+        TextureAtlasSprite previewSprite = (selectedMaterial != null) ? matSprites.get(selectedMaterial) : null;
         Integer previewColor = (selectedMaterial != null) ? matColors.get(selectedMaterial) : null;
 
-        // Brush / Eraser hover cursor
         if (isInGrid(mx, my) && (tool == Tool.BRUSH || tool == Tool.ERASER) && !drawing) {
             BlockPos hp = screenToGrid(mx, my);
             if (hp != null) {
                 int hx = (int) (cx + hp.getX() * es), hy = (int) (cy + hp.getZ() * es);
                 int sz = Math.max(1, (int) es);
-                if (tool == Tool.BRUSH && sz >= 10 && previewIcon != null) {
-                    RenderSystem.setShaderColor(1f, 1f, 1f, 0.55f);
-                    g.renderItem(previewIcon, hx + (sz - 16) / 2, hy + (sz - 16) / 2);
-                    RenderSystem.setShaderColor(1f, 1f, 1f, 1f);
+                if (tool == Tool.BRUSH && sz >= 4 && previewSprite != null) {
+                    RenderSystem.setShaderTexture(0, TextureAtlas.LOCATION_BLOCKS);
+                    g.blit(hx, hy, 0, sz, sz, previewSprite);
                 } else if (tool == Tool.BRUSH && previewColor != null) {
                     g.fill(hx, hy, hx + sz - 1, hy + sz - 1, (previewColor & 0x00FFFFFF) | 0xB0000000);
                 }
@@ -592,39 +595,29 @@ public class PlatformBuilderScreen extends AbstractContainerScreen<PlatformBuild
             }
         }
 
-        // RECT fill preview
-        if (tool == Tool.RECT && toolStart != null && toolEnd != null && previewIcon != null) {
+        if (tool == Tool.RECT && toolStart != null && toolEnd != null && previewSprite != null) {
             int rmnX = Math.min(toolStart.getX(), toolEnd.getX());
             int rmX = Math.max(toolStart.getX(), toolEnd.getX());
             int rmnZ = Math.min(toolStart.getZ(), toolEnd.getZ());
             int rmZ = Math.max(toolStart.getZ(), toolEnd.getZ());
             if ((rmX - rmnX + 1) * (rmZ - rmnZ + 1) <= 2500) {
+                RenderSystem.setShaderTexture(0, TextureAtlas.LOCATION_BLOCKS);
                 for (int gx = rmnX; gx <= rmX; gx++) {
                     for (int gz = rmnZ; gz <= rmZ; gz++) {
                         int sx = (int) (cx + gx * es), sy = (int) (cy + gz * es);
-                        if (es >= 10) {
-                            RenderSystem.setShaderColor(1f, 1f, 1f, 0.5f);
-                            g.renderItem(previewIcon, sx + 1, sy + 1);
-                            RenderSystem.setShaderColor(1f, 1f, 1f, 1f);
-                        } else if (previewColor != null) {
-                            g.fill(sx, sy, sx + Math.max(1, (int) es) - 1, sy + Math.max(1, (int) es) - 1,
-                                    (previewColor & 0x00FFFFFF) | 0xB0000000);
-                        }
+                        g.blit(sx, sy, 0, Math.max(1, (int) es), Math.max(1, (int) es), previewSprite);
                     }
                 }
             }
         }
 
-        // Circle center marker
         if (tool == Tool.CIRCLE && toolStart != null) {
             int scx = (int)(cx + toolStart.getX() * es), scy = (int)(cy + toolStart.getZ() * es);
             int sz = Math.max(1, (int)es);
-            // Crosshair at center
             g.fill(scx + sz/2 - 1, scy + 2, scx + sz/2 + 2, scy + sz - 2, 0xCCAA66CC);
             g.fill(scx + 2, scy + sz/2 - 1, scx + sz - 2, scy + sz/2 + 2, 0xCCAA66CC);
         }
 
-        // Line endpoints
         if (tool == Tool.LINE && toolStart != null) {
             int lx = (int)(cx + toolStart.getX() * es), ly = (int)(cy + toolStart.getZ() * es);
             int lsz = Math.max(1, (int)es);
@@ -644,15 +637,16 @@ public class PlatformBuilderScreen extends AbstractContainerScreen<PlatformBuild
                     int px = (int) (cx + tp.getX() * es);
                     int py = (int) (cy + tp.getZ() * es);
                     int psz = Math.max(1, (int) es);
-                    ItemStack icon = matIcons.get(entry.getValue());
-                    if (icon != null && psz >= 10) {
+                    TextureAtlasSprite sprite = matSprites.get(entry.getValue());
+                    if (sprite != null && psz >= 2) {
+                        RenderSystem.setShaderTexture(0, TextureAtlas.LOCATION_BLOCKS);
                         RenderSystem.setShaderColor(1f, 1f, 1f, 0.35f);
-                        g.renderItem(icon, px + (psz - 16) / 2, py + (psz - 16) / 2);
+                        g.blit(px, py, 0, psz, psz, sprite);
                         RenderSystem.setShaderColor(1f, 1f, 1f, 1f);
                     } else {
                         Integer col = matColors.get(entry.getValue());
                         if (col == null) {
-                            Block block = ForgeRegistries.BLOCKS.getValue(new ResourceLocation(entry.getValue()));
+                            Block block = BuiltInRegistries.BLOCK.get(ResourceLocation.parse(entry.getValue()));
                             if (block != null) {
                                 col = 0xFF000000 | block.defaultMapColor().col;
                                 matColors.put(entry.getValue(), col);
@@ -670,11 +664,10 @@ public class PlatformBuilderScreen extends AbstractContainerScreen<PlatformBuild
         }
     }
 
-    // ==================== INPUT ====================
+    // === INPUT ===
 
     @Override
     public boolean mouseClicked(double mx, double my, int btn) {
-        // Mode toggle button area — let the widget system handle it
         int modeBtnX = leftPos + 8, modeBtnY = topPos + TB_Y + 2;
         if (!inventoryMode && btn == 0
                 && mx >= modeBtnX && mx < modeBtnX + 36
@@ -696,11 +689,9 @@ public class PlatformBuilderScreen extends AbstractContainerScreen<PlatformBuild
             return true;
         }
 
-        // Material palette below grid
         int palY = topPos + 176;
         if (btn == 0 && my >= palY && my <= palY + 18) {
             int ix = matStartX;
-            // Left arrow
             if (matScroll > 0 && mx >= leftPos + 32 && mx < leftPos + 42) {
                 matScroll--; return true;
             }
@@ -760,7 +751,7 @@ public class PlatformBuilderScreen extends AbstractContainerScreen<PlatformBuild
             if (drawing) { drawing = false; lastDraw = null; return true; }
             if (toolStart != null) {
                 if (showChunks && tool == Tool.RECT) {
-                    int wx = menu.blockEntity.getBlockPos().getX(), wz = menu.blockEntity.getBlockPos().getZ();
+                    int wx = getBEPos().getX(), wz = getBEPos().getZ();
                     int mnX = Math.min(toolStart.getX(), toolEnd.getX());
                     int mxX = Math.max(toolStart.getX(), toolEnd.getX());
                     int mnZ = Math.min(toolStart.getZ(), toolEnd.getZ());
@@ -788,10 +779,10 @@ public class PlatformBuilderScreen extends AbstractContainerScreen<PlatformBuild
     }
 
     @Override
-    public boolean mouseScrolled(double mx, double my, double d) {
-        if (inventoryMode) return super.mouseScrolled(mx, my, d);
+    public boolean mouseScrolled(double mx, double my, double scrollX, double scrollY) {
+        if (inventoryMode) return super.mouseScrolled(mx, my, scrollX, scrollY);
         if (isInGrid((int) mx, (int) my)) {
-            float nz = zoom * (d > 0 ? 1.10f : 0.91f);
+            float nz = zoom * (scrollY > 0 ? 1.10f : 0.91f);
             nz = Math.max(MIN_ZOOM, Math.min(MAX_ZOOM, nz));
             float cx = leftPos + GRID_X + GRID_W / 2f + panX;
             float cy = topPos + GRID_Y + GRID_H / 2f + panY;
@@ -800,7 +791,7 @@ public class PlatformBuilderScreen extends AbstractContainerScreen<PlatformBuild
             panX += wx * (oe - ne); panY += wy * (oe - ne);
             zoom = nz; return true;
         }
-        return super.mouseScrolled(mx, my, d);
+        return super.mouseScrolled(mx, my, scrollX, scrollY);
     }
 
     @Override
@@ -812,7 +803,7 @@ public class PlatformBuilderScreen extends AbstractContainerScreen<PlatformBuild
         return super.keyPressed(k, s, m);
     }
 
-    // ==================== ACTIONS ====================
+    // === ACTIONS ===
 
     private void applyTool(int mx, int my) {
         BlockPos p = screenToGrid(mx, my);
@@ -856,7 +847,6 @@ public class PlatformBuilderScreen extends AbstractContainerScreen<PlatformBuild
         int cx = toolStart.getX(), cz = toolStart.getZ();
         int dx = toolEnd.getX() - cx, dz = toolEnd.getZ() - cz;
         int r2 = dx * dx + dz * dz;
-        // Iterate bounding box of circle
         int r = (int) Math.ceil(Math.sqrt(r2));
         for (int x = cx - r; x <= cx + r; x++)
             for (int z = cz - r; z <= cz + r; z++)
@@ -885,7 +875,6 @@ public class PlatformBuilderScreen extends AbstractContainerScreen<PlatformBuild
         toolStart = null; toolEnd = null;
     }
 
-    /** Bresenham check: is (gx, gz) on the line between toolStart and toolEnd? */
     private boolean isOnLine(int gx, int gz) {
         int x1 = toolStart.getX(), z1 = toolStart.getZ();
         int x2 = toolEnd.getX(), z2 = toolEnd.getZ();
@@ -911,23 +900,23 @@ public class PlatformBuilderScreen extends AbstractContainerScreen<PlatformBuild
         design.clear(); design.putAll(undoStack.pop());
     }
 
-    // ==================== UTILS ====================
+    // === UTILS ===
 
     private void refreshMaterials() {
-        var handler = menu.blockEntity.getItemHandler();
+        if (getBE() == null) return;
+        var inv = getBE().getInventory();
         Set<String> current = new LinkedHashSet<>();
-        for (int i = 0; i < handler.getSlots(); i++) {
-            ItemStack st = handler.getStackInSlot(i);
+        for (int i = 0; i < inv.getContainerSize(); i++) {
+            ItemStack st = inv.getItem(i);
             if (!st.isEmpty() && st.getItem() instanceof BlockItem bi) {
-                ResourceLocation id = ForgeRegistries.BLOCKS.getKey(bi.getBlock());
+                ResourceLocation id = BuiltInRegistries.BLOCK.getKey(bi.getBlock());
                 if (id != null) current.add(id.toString());
             }
         }
         for (String m : design.values()) current.add(m);
 
-        // Pig Certificate: add all concrete types to material palette
-        if (menu.blockEntity.hasPigCertificate()) {
-            for (var entry : ForgeRegistries.BLOCKS.getEntries()) {
+        if (getBE().hasPigCertificate()) {
+            for (var entry : BuiltInRegistries.BLOCK.entrySet()) {
                 ResourceLocation id = entry.getKey().location();
                 String idStr = id.toString();
                 if (idStr.endsWith("_concrete")) {
@@ -938,74 +927,31 @@ public class PlatformBuilderScreen extends AbstractContainerScreen<PlatformBuild
 
         if (current.size() == materials.size() && current.containsAll(materials)) return;
 
-        materials.clear(); matIcons.clear(); matColors.clear();
+        materials.clear(); matSprites.clear(); matIcons.clear(); matColors.clear();
         for (String id : current) {
             materials.add(id);
-            var block = ForgeRegistries.BLOCKS.getValue(new ResourceLocation(id));
+            var block = BuiltInRegistries.BLOCK.get(ResourceLocation.parse(id));
             if (block != null) {
                 matIcons.put(id, new ItemStack(block.asItem()));
                 matColors.put(id, 0xFF000000 | block.defaultMapColor().col);
+                TextureAtlasSprite sprite = getBlockFaceSprite(block);
+                if (sprite != null) matSprites.put(id, sprite);
             }
         }
     }
 
-    private void copySelection() {
-        clipboard = null;
-        clipboardOrigin = null;
-        if (tool == Tool.RECT && toolStart != null && toolEnd != null) {
-            int mnX = Math.min(toolStart.getX(), toolEnd.getX());
-            int mxX = Math.max(toolStart.getX(), toolEnd.getX());
-            int mnZ = Math.min(toolStart.getZ(), toolEnd.getZ());
-            int mxZ = Math.max(toolStart.getZ(), toolEnd.getZ());
-            clipboard = new LinkedHashMap<>();
-            clipboardOrigin = new BlockPos(mnX, 0, mnZ);
-            for (int x = mnX; x <= mxX; x++) {
-                for (int z = mnZ; z <= mxZ; z++) {
-                    BlockPos p = new BlockPos(x, 0, z);
-                    String mat = design.get(p);
-                    if (mat == null) mat = existingBlocks.get(p);
-                    if (mat != null)
-                        clipboard.put(new BlockPos(x - mnX, 0, z - mnZ), mat);
-                }
-            }
-            clipCenterX = (mxX - mnX) / 2;
-            clipCenterZ = (mxZ - mnZ) / 2;
-        }
-    }
-
-    private void pasteClipboard() {
-        if (clipboard == null || clipboard.isEmpty()) return;
-        BlockPos anchor = toolStart != null ? toolStart : lastClickPos;
-        if (anchor == null) return;
-        saveUndo();
-        for (var entry : clipboard.entrySet()) {
-            BlockPos target = anchor.offset(entry.getKey().getX() - clipCenterX, 0, entry.getKey().getZ() - clipCenterZ);
-            if (!design.containsKey(target))
-                design.put(target, entry.getValue());
-        }
-    }
-
-    private void scanExistingBlocks() {
-        existingBlocks.clear();
-        if (minecraft == null || minecraft.level == null) return;
-
-        BlockPos machinePos = menu.blockEntity.getBlockPos();
-        int offsetY = menu.blockEntity.getBuildOffsetY();
-        int scanY = machinePos.getY() + offsetY;
-        lastScannedOffsetY = offsetY;
-
-        var level = minecraft.level;
-        int range = 48;
-        for (int dx = -range; dx <= range; dx++) {
-            for (int dz = -range; dz <= range; dz++) {
-                var state = level.getBlockState(new BlockPos(machinePos.getX() + dx, scanY, machinePos.getZ() + dz));
-                if (!state.isAir()) {
-                    var id = ForgeRegistries.BLOCKS.getKey(state.getBlock());
-                    if (id != null) {
-                        existingBlocks.put(new BlockPos(dx, 0, dz), id.toString());
-                    }
-                }
-            }
+    /** Get the top-face or representative sprite of a block for flat preview. */
+    private static TextureAtlasSprite getBlockFaceSprite(Block block) {
+        try {
+            var model = Minecraft.getInstance().getBlockRenderer().getBlockModel(block.defaultBlockState());
+            var quads = model.getQuads(block.defaultBlockState(), Direction.UP, RandomSource.create());
+            if (!quads.isEmpty()) return quads.get(0).getSprite();
+            // fallback: try null direction (general quads)
+            quads = model.getQuads(block.defaultBlockState(), null, RandomSource.create());
+            if (!quads.isEmpty()) return quads.get(0).getSprite();
+            return model.getParticleIcon();
+        } catch (Exception e) {
+            return null;
         }
     }
 
@@ -1113,6 +1059,7 @@ public class PlatformBuilderScreen extends AbstractContainerScreen<PlatformBuild
     private void handlePopupClick(int mx, int my) {
         int pw = 220, ph = 365;
         int px = (width - pw) / 2, py = (height - ph) / 2;
+        // Close button
         if (mx >= px + pw - 20 && mx < px + pw - 4 && my >= py + 4 && my < py + 20) {
             showPatternPopup = false; return;
         }
@@ -1140,7 +1087,9 @@ public class PlatformBuilderScreen extends AbstractContainerScreen<PlatformBuild
         g.fill(px, py, px + pw, py + ph, 0xE8202020);
         drawBorder(g, px, py, pw, ph);
         g.drawCenteredString(font, Component.literal("选择图案"), px + pw / 2, py + 6, 0xFFFFFFFF);
-        g.drawString(font, Component.literal("✕"), px + pw - 18, py + 6, 0xFFFF6666, false);
+        // Close X
+        int cx = px + pw - 18, cy = py + 6;
+        g.drawString(font, Component.literal("✕"), cx, cy, 0xFFFF6666, false);
 
         String m1 = selectedMaterial;
         if (m1 == null && !materials.isEmpty()) m1 = materials.get(0);
@@ -1155,6 +1104,7 @@ public class PlatformBuilderScreen extends AbstractContainerScreen<PlatformBuild
             int ry = py + 24 + i * rowH;
             if (i == selectedPattern)
                 g.fill(px + 4, ry - 2, px + pw - 4, ry + rowH - 1, 0x40FFFFFF);
+
             String name = PATTERN_NAMES[i];
             for (int x = 0; x < 16; x++) {
                 for (int z = 0; z < 16; z++) {
@@ -1174,6 +1124,7 @@ public class PlatformBuilderScreen extends AbstractContainerScreen<PlatformBuild
                         useM1 ? c1 : c2);
                 }
             }
+
             g.drawString(font, Component.literal(name), px + 48, ry + 10, 0xFFFFFFFF, false);
             int sBtnX = px + pw - 50, sBtnY = ry + 6;
             g.fill(sBtnX, sBtnY, sBtnX + 36, sBtnY + 18, i == selectedPattern ? 0xFF668866 : 0xFF444444);
@@ -1254,13 +1205,36 @@ public class PlatformBuilderScreen extends AbstractContainerScreen<PlatformBuild
         g.fill(x1, y, x2, y + 1, color);
     }
 
-    // ==================== NETWORK ====================
+    // === NETWORK ===
 
     private void sendDesign() {
-        ModMessages.sendToServer(new SyncDesignPacket(menu.blockEntity.getBlockPos(), new HashMap<>(design)));
+        PlatformServices.PLATFORM.sendSyncDesignPacket(getBEPos(), new HashMap<>(design));
     }
 
-    @Override
+    private PlatformBuilderBlockEntity getBE() {
+        return menu.blockEntity;
+    }
+
+    private BlockPos getBEPos() {
+        return getBE() != null ? getBE().getBlockPos() : BlockPos.ZERO;
+    }
+
+    private int getBuildSpeed() {
+        return getBE() != null ? getBE().getBuildSpeed() : 50;
+    }
+
+    private void setBuildSpeed(int speed) {
+        if (getBE() != null) getBE().setBuildSpeed(speed);
+    }
+
+    private int getBuildOffsetY() {
+        return getBE() != null ? getBE().getBuildOffsetY() : 0;
+    }
+
+    private void setBuildOffsetY(int offset) {
+        if (getBE() != null) getBE().setBuildOffsetY(offset);
+    }
+
     public void onClose() { sendDesign(); super.onClose(); }
 
     public void updateDesign(Map<BlockPos, String> d) {

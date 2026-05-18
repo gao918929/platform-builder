@@ -1,0 +1,14 @@
+{
+  "type": "minecraft:crafting_shaped",
+  "pattern": [
+    "III",
+    "IPI",
+    "IRI"
+  ],
+  "key": {
+    "I": { "item": "minecraft:iron_ingot" },
+    "P": { "item": "minecraft:piston" },
+    "R": { "item": "minecraft:redstone_block" }
+  },
+  "result": { "item": "platformbuilder:platform_builder" }
+}

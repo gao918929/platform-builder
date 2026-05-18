@@ -45,8 +45,9 @@ public class PlatformBuilderScreen extends AbstractContainerScreen<PlatformBuild
         Tool(int c, String l) { color = c; label = l; }
     }
 
-    private enum Mode { NORMAL, COPY, PASTE }
+    private enum Mode { NORMAL, COPY, PASTE, REPLACE }
     private Mode mode = Mode.NORMAL;
+    private String replaceFrom;
 
     private static final String[] PATTERN_NAMES = {
         "棋盘格", "横条纹", "竖条纹", "边框", "L↖", "L↗", "L↙", "L↘", "十字", "马路", "随机"
@@ -147,29 +148,33 @@ public class PlatformBuilderScreen extends AbstractContainerScreen<PlatformBuild
                 Component.literal("+"), b -> changeOffset(1)
         ).pos(leftPos + 120, spdY).size(14, 20).build());
 
-        // Scan, copy, paste, generate, AI buttons
+        // Scan, copy, paste, replace, generate, AI buttons
         addRenderableWidget(Button.builder(
                 Component.literal("扫描"), b -> scanExistingBlocks()
-        ).pos(leftPos + 142, spdY).size(26, 20).build());
+        ).pos(leftPos + 142, spdY).size(24, 20).build());
 
         addRenderableWidget(Button.builder(
                 Component.literal("复制"), b -> { mode = Mode.COPY; tool = Tool.RECT; selectedMaterial = null; }
-        ).pos(leftPos + 170, spdY).size(26, 20).build());
+        ).pos(leftPos + 168, spdY).size(24, 20).build());
 
         addRenderableWidget(Button.builder(
                 Component.literal("粘贴"), b -> { if (clipboard != null && !clipboard.isEmpty()) mode = Mode.PASTE; }
-        ).pos(leftPos + 198, spdY).size(26, 20).build());
+        ).pos(leftPos + 194, spdY).size(24, 20).build());
+
+        addRenderableWidget(Button.builder(
+                Component.literal("替换"), b -> { mode = Mode.REPLACE; replaceFrom = null; }
+        ).pos(leftPos + 220, spdY).size(24, 20).build());
 
         addRenderableWidget(Button.builder(
                 Component.literal("生成"), b -> {
                     showPatternPopup = true; selectedPattern = -1;
                     popM1Idx = 0; popM2Idx = Math.min(1, materials.size() - 1);
                 }
-        ).pos(leftPos + 226, spdY).size(26, 20).build());
+        ).pos(leftPos + 246, spdY).size(24, 20).build());
 
         addRenderableWidget(Button.builder(
                 Component.literal("AI"), b -> aiGenerate()
-        ).pos(leftPos + 254, spdY).size(24, 20).build());
+        ).pos(leftPos + 272, spdY).size(22, 20).build());
 
         // Build button
         addRenderableWidget(Button.builder(
@@ -177,7 +182,7 @@ public class PlatformBuilderScreen extends AbstractContainerScreen<PlatformBuild
                     sendDesign();
                     ModMessages.sendToServer(new BuildPlatformPacket(menu.blockEntity.getBlockPos()));
                 }
-        ).pos(leftPos + 282, spdY).size(48, 20).build());
+        ).pos(leftPos + 298, spdY).size(32, 20).build());
     }
 
     private void changeSpeed(int delta) {
@@ -403,8 +408,12 @@ public class PlatformBuilderScreen extends AbstractContainerScreen<PlatformBuild
         }
 
         if (!inventoryMode && mode != Mode.NORMAL)
-            g.drawString(font, Component.literal(mode == Mode.COPY ? "复制模式(拖拽框选)" : "粘贴模式(点击放置, Esc取消)"),
-                leftPos + 8, topPos + imageHeight - 12, 0xFFFFFF88, false);
+            g.drawString(font, Component.literal(switch (mode) {
+                case COPY -> "复制模式(拖拽框选)";
+                case PASTE -> "粘贴模式(点击放置, Esc取消)";
+                case REPLACE -> replaceFrom == null ? "替换模式(点击要替换的方块)" : "替换模式(点击新材料完成替换)";
+                default -> "";
+            }), leftPos + 8, topPos + imageHeight - 12, 0xFFFFFF88, false);
 
         if (showPatternPopup) renderPopup(g);
     }
@@ -713,6 +722,9 @@ public class PlatformBuilderScreen extends AbstractContainerScreen<PlatformBuild
             for (int i = 0; i < 12 && i + matScroll < materials.size(); i++) {
                 if (mx >= ix && mx < ix + 20) {
                     String mat = materials.get(i + matScroll);
+                    if (mode == Mode.REPLACE && replaceFrom != null) {
+                        doReplace(mat); mode = Mode.NORMAL; return true;
+                    }
                     selectedMaterial = mat.equals(selectedMaterial) ? null : mat;
                     return true;
                 }
@@ -729,14 +741,19 @@ public class PlatformBuilderScreen extends AbstractContainerScreen<PlatformBuild
                 pasteClipboard();
                 return true;
             }
+            if (mode == Mode.REPLACE && btn == 0) {
+                String mat = design.get(lastClickPos);
+                if (mat != null && replaceFrom == null) { replaceFrom = mat; return true; }
+                mode = Mode.NORMAL; return true;
+            }
             if (btn == 0) {
                 switch (tool) {
                     case BRUSH, ERASER -> {
-                        if (mode == Mode.COPY) break;
+                        if (mode == Mode.COPY || mode == Mode.REPLACE) break;
                         drawing = true; lastDraw = null; applyTool((int) mx, (int) my);
                     }
                     case RECT, CIRCLE, LINE -> { toolStart = screenToGrid((int) mx, (int) my); toolEnd = toolStart; }
-                    case PIPETTE -> { if (mode != Mode.COPY) pickMaterial((int) mx, (int) my); }
+                    case PIPETTE -> { if (mode == Mode.NORMAL) pickMaterial((int) mx, (int) my); }
                 }
                 return true;
             }
@@ -764,17 +781,6 @@ public class PlatformBuilderScreen extends AbstractContainerScreen<PlatformBuild
         if (btn == 0) {
             if (drawing) { drawing = false; lastDraw = null; return true; }
             if (toolStart != null) {
-                if (showChunks && tool == Tool.RECT) {
-                    int wx = menu.blockEntity.getBlockPos().getX(), wz = menu.blockEntity.getBlockPos().getZ();
-                    int mnX = Math.min(toolStart.getX(), toolEnd.getX());
-                    int mxX = Math.max(toolStart.getX(), toolEnd.getX());
-                    int mnZ = Math.min(toolStart.getZ(), toolEnd.getZ());
-                    int mxZ = Math.max(toolStart.getZ(), toolEnd.getZ());
-                    int w = mxX - mnX + 1, h = mxZ - mnZ + 1;
-                    int sX = snapToChunk(mnX, wx), sZ = snapToChunk(mnZ, wz);
-                    toolStart = new BlockPos(sX, 0, sZ);
-                    toolEnd = new BlockPos(sX + w - 1, 0, sZ + h - 1);
-                }
                 if (mode == Mode.COPY && tool == Tool.RECT) {
                     copySelection();
                     mode = Mode.PASTE;
@@ -1212,6 +1218,27 @@ public class PlatformBuilderScreen extends AbstractContainerScreen<PlatformBuild
         g.drawCenteredString(font, Component.literal("确定"), btnX + 20, btnY + 5, 0xFFFFFFFF);
     }
 
+    private void doReplace(String to) {
+        if (replaceFrom == null || replaceFrom.equals(to)) return;
+        saveUndo();
+        int mnX = Integer.MIN_VALUE, mxX = Integer.MAX_VALUE;
+        int mnZ = Integer.MIN_VALUE, mxZ = Integer.MAX_VALUE;
+        if (tool == Tool.RECT && toolStart != null && toolEnd != null) {
+            mnX = Math.min(toolStart.getX(), toolEnd.getX());
+            mxX = Math.max(toolStart.getX(), toolEnd.getX());
+            mnZ = Math.min(toolStart.getZ(), toolEnd.getZ());
+            mxZ = Math.max(toolStart.getZ(), toolEnd.getZ());
+        }
+        var toChange = new ArrayList<BlockPos>();
+        for (var e : design.entrySet()) {
+            BlockPos p = e.getKey();
+            if (e.getValue().equals(replaceFrom)
+                && p.getX() >= mnX && p.getX() <= mxX && p.getZ() >= mnZ && p.getZ() <= mxZ)
+                toChange.add(p);
+        }
+        for (BlockPos p : toChange) design.put(p, to);
+    }
+
     private void generatePatternToClipboard(int idx) {
         int mnX = 0, mxX = 15, mnZ = 0, mxZ = 15;
         if (tool == Tool.RECT && toolStart != null && toolEnd != null) {
@@ -1260,11 +1287,6 @@ public class PlatformBuilderScreen extends AbstractContainerScreen<PlatformBuild
         float cx = leftPos + GRID_X + GRID_W / 2f + panX;
         float cy = topPos + GRID_Y + GRID_H / 2f + panY;
         return new BlockPos((int) Math.floor((mx - cx) / es), 0, (int) Math.floor((my - cy) / es));
-    }
-
-    private static int snapToChunk(int gx, int worldX) {
-        int mod = Math.floorMod(worldX + gx, 16);
-        return mod < 8 ? gx - mod : gx + (16 - mod);
     }
 
     private static String shortName(String id) {

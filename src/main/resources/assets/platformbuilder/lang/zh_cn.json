@@ -1,0 +1,7 @@
+{
+  "itemGroup.platformbuilder": "平台建造器",
+  "block.platformbuilder.platform_builder": "平台建造机",
+  "gui.platformbuilder.build": "开始建造",
+  "item.platformbuilder.pig_certificate": "猪猪之证",
+  "item.platformbuilder.pig_certificate.tooltip": "§6放入机器后，可获得无限所有种类的混凝土！"
+}

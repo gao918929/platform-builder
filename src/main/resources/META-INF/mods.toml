@@ -1,0 +1,25 @@
+modLoader = "javafml"
+loaderVersion = "[47,)"
+license = "MIT"
+
+[[mods]]
+modId = "platformbuilder"
+version = "1.0.0"
+displayName = "Platform Builder"
+description = '''
+一个可以虚拟设计平台并通过UI界面自动建造的Mod。
+设计无限大小的平台形状，放入材料，自动在世界上建造！
+'''
+[[dependencies.platformbuilder]]
+    modId = "forge"
+    mandatory = true
+    versionRange = "[47,)"
+    ordering = "NONE"
+    side = "BOTH"
+
+[[dependencies.platformbuilder]]
+    modId = "minecraft"
+    mandatory = true
+    versionRange = "[1.20.1]"
+    ordering = "NONE"
+    side = "BOTH"

@@ -1,0 +1,7 @@
+{
+  "variants": {
+    "": {
+      "model": "platformbuilder:block/platform_builder"
+    }
+  }
+}

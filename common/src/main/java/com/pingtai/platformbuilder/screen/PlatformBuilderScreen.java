@@ -47,7 +47,10 @@ public class PlatformBuilderScreen extends AbstractContainerScreen<PlatformBuild
     private enum Mode { NORMAL, COPY, PASTE }
     private Mode mode = Mode.NORMAL;
 
-    private static final String[] PATTERN_NAMES = {"棋盘格", "横条纹", "竖条纹", "边框", "L↖", "L↗", "L↙", "L↘", "随机"};
+    private static final String[] PATTERN_NAMES = {
+        "棋盘格", "横条纹", "竖条纹", "边框", "L↖", "L↗", "L↙", "L↘", "十字", "马路", "随机"
+    };
+    private int popM1Idx, popM2Idx;
     private int patternIdx;
     private Button offsetResetBtn;
     private Button scanBtn, copyBtn, pasteBtn, genBtn, aiBtn, buildBtn;
@@ -150,7 +153,10 @@ public class PlatformBuilderScreen extends AbstractContainerScreen<PlatformBuild
         ).pos(leftPos + 198, spdY).size(26, 20).build());
 
         addRenderableWidget(Button.builder(
-                Component.literal("生成"), b -> { showPatternPopup = true; selectedPattern = -1; }
+                Component.literal("生成"), b -> {
+                    showPatternPopup = true; selectedPattern = -1;
+                    popM1Idx = 0; popM2Idx = Math.min(1, materials.size() - 1);
+                }
         ).pos(leftPos + 226, spdY).size(26, 20).build());
 
         addRenderableWidget(Button.builder(
@@ -985,6 +991,8 @@ public class PlatformBuilderScreen extends AbstractContainerScreen<PlatformBuild
                     case "L↗" -> x == mxX || z == mnZ;
                     case "L↙" -> x == mnX || z == mxZ;
                     case "L↘" -> x == mxX || z == mxZ;
+                    case "十字" -> (x == (mnX + mxX) / 2 || x == (mnX + mxX + 1) / 2) || (z == (mnZ + mxZ) / 2 || z == (mnZ + mxZ + 1) / 2);
+                    case "马路" -> { int cz = (mnZ + mxZ) / 2; yield z >= cz - 1 && z <= cz + 1; }
                     default -> new Random().nextBoolean();
                 };
                 design.put(new BlockPos(x, 0, z), useM1 ? m1 : m2);
@@ -1056,17 +1064,23 @@ public class PlatformBuilderScreen extends AbstractContainerScreen<PlatformBuild
     }
 
     private void handlePopupClick(int mx, int my) {
-        int pw = 220, ph = 365;
+        int pw = 340, ph = 266;
         int px = (width - pw) / 2, py = (height - ph) / 2;
-        // Close button
         if (mx >= px + pw - 20 && mx < px + pw - 4 && my >= py + 4 && my < py + 20) {
             showPatternPopup = false; return;
         }
-        int rowH = 35;
-        int baseY = py + 24;
+        // Material selectors
+        if (my >= py + 24 && my < py + 44) {
+            if (mx >= px + 27 && mx < px + 49) { popM1Idx = (popM1Idx + 1) % Math.max(1, materials.size()); return; }
+            if (mx >= px + 75 && mx < px + 97) { popM2Idx = (popM2Idx + 1) % Math.max(1, materials.size()); return; }
+        }
+        int rowH = 34, cols = 2;
+        int colW = (pw - 24) / cols;
         for (int i = 0; i < PATTERN_NAMES.length; i++) {
-            int ry = baseY + i * rowH;
-            if (mx >= px + 10 && mx < px + 120 && my >= ry && my < ry + rowH) {
+            int col = i % cols, row = i / cols;
+            int cx = px + 8 + col * colW;
+            int ry = py + 48 + row * rowH;
+            if (mx >= cx && mx < cx + colW && my >= ry && my < ry + rowH) {
                 selectedPattern = i; return;
             }
         }
@@ -1081,28 +1095,37 @@ public class PlatformBuilderScreen extends AbstractContainerScreen<PlatformBuild
     }
 
     private void renderPopup(GuiGraphics g) {
-        int pw = 220, ph = 365;
+        int pw = 340, ph = 266;
         int px = (width - pw) / 2, py = (height - ph) / 2;
         g.fill(px, py, px + pw, py + ph, 0xE8202020);
         drawBorder(g, px, py, pw, ph);
         g.drawCenteredString(font, Component.literal("选择图案"), px + pw / 2, py + 6, 0xFFFFFFFF);
-        // Close X
-        int cx = px + pw - 18, cy = py + 6;
-        g.drawString(font, Component.literal("✕"), cx, cy, 0xFFFF6666, false);
+        g.drawString(font, Component.literal("✕"), px + pw - 18, py + 6, 0xFFFF6666, false);
 
-        String m1 = selectedMaterial;
-        if (m1 == null && !materials.isEmpty()) m1 = materials.get(0);
-        if (m1 == null) m1 = "minecraft:white_concrete";
-        String m2 = m1;
-        for (String m : materials) { if (!m.equals(m1)) { m2 = m; break; } }
+        if (popM1Idx >= materials.size()) popM1Idx = 0;
+        if (popM2Idx >= materials.size()) popM2Idx = materials.isEmpty() ? 0 : Math.min(1, materials.size() - 1);
+        String m1 = materials.isEmpty() ? "minecraft:white_concrete" : materials.get(popM1Idx);
+        String m2 = materials.size() > 1 ? materials.get(popM2Idx) : m1;
         int c1 = matColors.getOrDefault(m1, 0xFFFFFFFF);
         int c2 = matColors.getOrDefault(m2, 0xFF888888);
 
-        int rowH = 35, cellSz = 2;
+        g.drawString(font, Component.literal("主:"), px + 8, py + 26, 0xFFAAAAAA, false);
+        g.fill(px + 28, py + 24, px + 48, py + 44, c1);
+        g.fill(px + 27, py + 23, px + 49, py + 45, 0xFFFFFFFF);
+        g.fill(px + 28, py + 24, px + 48, py + 44, c1);
+        g.drawString(font, Component.literal("副:"), px + 56, py + 26, 0xFFAAAAAA, false);
+        g.fill(px + 76, py + 24, px + 96, py + 44, c2);
+        g.fill(px + 75, py + 23, px + 97, py + 45, 0xFFFFFFFF);
+        g.fill(px + 76, py + 24, px + 96, py + 44, c2);
+
+        int rowH = 34, cellSz = 2, cols = 2;
+        int colW = (pw - 24) / cols;
         for (int i = 0; i < PATTERN_NAMES.length; i++) {
-            int ry = py + 24 + i * rowH;
+            int col = i % cols, row = i / cols;
+            int cx = px + 8 + col * colW;
+            int ry = py + 48 + row * rowH;
             if (i == selectedPattern)
-                g.fill(px + 4, ry - 2, px + pw - 4, ry + rowH - 1, 0x40FFFFFF);
+                g.fill(cx - 2, ry - 2, cx + colW - 4, ry + rowH - 2, 0x40FFFFFF);
 
             String name = PATTERN_NAMES[i];
             for (int x = 0; x < 16; x++) {
@@ -1116,19 +1139,20 @@ public class PlatformBuilderScreen extends AbstractContainerScreen<PlatformBuild
                         case "L↗" -> x == 15 || z == 0;
                         case "L↙" -> x == 0 || z == 15;
                         case "L↘" -> x == 15 || z == 15;
+                        case "十字" -> x == 7 || x == 8 || z == 7 || z == 8;
+                        case "马路" -> z >= 7 && z <= 8;
                         default -> (x * 7 + z * 13) % 3 != 0;
                     };
-                    g.fill(px + 10 + x * cellSz, ry + 3 + z * cellSz,
-                        px + 10 + x * cellSz + cellSz - 1, ry + 3 + z * cellSz + cellSz - 1,
+                    g.fill(cx + x * cellSz, ry + 2 + z * cellSz,
+                        cx + x * cellSz + cellSz - 1, ry + 2 + z * cellSz + cellSz - 1,
                         useM1 ? c1 : c2);
                 }
             }
-
-            g.drawString(font, Component.literal(name), px + 48, ry + 10, 0xFFFFFFFF, false);
-            int sBtnX = px + pw - 50, sBtnY = ry + 6;
-            g.fill(sBtnX, sBtnY, sBtnX + 36, sBtnY + 18, i == selectedPattern ? 0xFF668866 : 0xFF444444);
+            g.drawString(font, Component.literal(name), cx + 36, ry + 8, 0xFFFFFFFF, false);
+            int bX = cx + colW - 40, bY = ry + 6;
+            g.fill(bX, bY, bX + 32, bY + 18, i == selectedPattern ? 0xFF668866 : 0xFF444444);
             g.drawCenteredString(font, Component.literal(i == selectedPattern ? "已选" : "选择"),
-                sBtnX + 18, sBtnY + 5, 0xFFFFFFFF);
+                bX + 16, bY + 5, 0xFFFFFFFF);
         }
 
         int btnX = px + pw - 50, btnY = py + ph - 24;
@@ -1144,11 +1168,11 @@ public class PlatformBuilderScreen extends AbstractContainerScreen<PlatformBuild
             mnZ = Math.min(toolStart.getZ(), toolEnd.getZ());
             mxZ = Math.max(toolStart.getZ(), toolEnd.getZ());
         }
-        String m1 = selectedMaterial;
-        if (m1 == null && !materials.isEmpty()) m1 = materials.get(0);
+        if (popM1Idx >= materials.size()) popM1Idx = 0;
+        String m1 = materials.isEmpty() ? null : materials.get(popM1Idx);
         if (m1 == null) return;
-        String m2 = m1;
-        for (String m : materials) { if (!m.equals(m1)) { m2 = m; break; } }
+        if (popM2Idx >= materials.size()) popM2Idx = Math.min(popM1Idx + 1, materials.size() - 1);
+        String m2 = materials.size() > 1 ? materials.get(popM2Idx) : m1;
 
         clipboard = new LinkedHashMap<>();
         String name = PATTERN_NAMES[idx];
@@ -1163,6 +1187,8 @@ public class PlatformBuilderScreen extends AbstractContainerScreen<PlatformBuild
                     case "L↗" -> x == mxX || z == mnZ;
                     case "L↙" -> x == mnX || z == mxZ;
                     case "L↘" -> x == mxX || z == mxZ;
+                    case "十字" -> (x == (mnX + mxX) / 2 || x == (mnX + mxX + 1) / 2) || (z == (mnZ + mxZ) / 2 || z == (mnZ + mxZ + 1) / 2);
+                    case "马路" -> { int cz = (mnZ + mxZ) / 2; yield z >= cz - 1 && z <= cz + 1; }
                     default -> new Random().nextBoolean();
                 };
                 clipboard.put(new BlockPos(x - mnX, 0, z - mnZ), useM1 ? m1 : m2);

@@ -997,8 +997,8 @@ public class PlatformBuilderScreen extends AbstractContainerScreen<PlatformBuild
                     case "L↗" -> x == mxX || z == mnZ;
                     case "L↙" -> x == mnX || z == mxZ;
                     case "L↘" -> x == mxX || z == mxZ;
-                    case "十字" -> (x == (mnX + mxX) / 2 || x == (mnX + mxX + 1) / 2) || (z == (mnZ + mxZ) / 2 || z == (mnZ + mxZ + 1) / 2);
-                    case "马路" -> { int cz = (mnZ + mxZ) / 2; yield z >= cz - 1 && z <= cz + 1; }
+                    case "十字" -> { int cx = (mnX + mxX) / 2, cz = (mnZ + mxZ) / 2; yield (x >= cx - 1 && x <= cx + 2) || (z >= cz - 1 && z <= cz + 2); }
+                    case "马路" -> { int cz = (mnZ + mxZ) / 2; yield z >= cz - 1 && z <= cz + 2; }
                     default -> new Random().nextBoolean();
                 };
                 design.put(new BlockPos(x, 0, z), useM1 ? m1 : m2);
@@ -1145,8 +1145,8 @@ public class PlatformBuilderScreen extends AbstractContainerScreen<PlatformBuild
                         case "L↗" -> x == 15 || z == 0;
                         case "L↙" -> x == 0 || z == 15;
                         case "L↘" -> x == 15 || z == 15;
-                        case "十字" -> x == 7 || x == 8 || z == 7 || z == 8;
-                        case "马路" -> z >= 7 && z <= 8;
+                        case "十字" -> (x >= 6 && x <= 9) || (z >= 6 && z <= 9);
+                        case "马路" -> z >= 6 && z <= 9;
                         default -> (x * 7 + z * 13) % 3 != 0;
                     };
                     g.fill(cx + x * cellSz, ry + 2 + z * cellSz,
@@ -1214,8 +1214,8 @@ public class PlatformBuilderScreen extends AbstractContainerScreen<PlatformBuild
                     case "L↗" -> x == mxX || z == mnZ;
                     case "L↙" -> x == mnX || z == mxZ;
                     case "L↘" -> x == mxX || z == mxZ;
-                    case "十字" -> (x == (mnX + mxX) / 2 || x == (mnX + mxX + 1) / 2) || (z == (mnZ + mxZ) / 2 || z == (mnZ + mxZ + 1) / 2);
-                    case "马路" -> { int cz = (mnZ + mxZ) / 2; yield z >= cz - 1 && z <= cz + 1; }
+                    case "十字" -> { int cx = (mnX + mxX) / 2, cz = (mnZ + mxZ) / 2; yield (x >= cx - 1 && x <= cx + 2) || (z >= cz - 1 && z <= cz + 2); }
+                    case "马路" -> { int cz = (mnZ + mxZ) / 2; yield z >= cz - 1 && z <= cz + 2; }
                     default -> new Random().nextBoolean();
                 };
                 clipboard.put(new BlockPos(x - mnX, 0, z - mnZ), useM1 ? m1 : m2);

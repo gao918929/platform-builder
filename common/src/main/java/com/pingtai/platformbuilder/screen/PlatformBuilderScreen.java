@@ -549,8 +549,8 @@ public class PlatformBuilderScreen extends AbstractContainerScreen<PlatformBuild
                 if (tool == Tool.LINE && toolStart != null && toolEnd != null && isOnLine(gx, gz))
                     g.fill(sx, sy, sx + sz - 1, sy + sz - 1, 0x6044AAAA);
 
-                int cellAlpha = Math.min(0x60, Math.max(0, (int)(sz * 0x18)));
-                if (cellAlpha > 3) {
+                if (sz >= 6) {
+                    int cellAlpha = Math.min(0x50, (sz - 5) * 12);
                     int lc = (cellAlpha << 24) | 0xFFFFFF;
                     g.fill(sx, sy, sx + sz, sy + 1, lc);
                     g.fill(sx, sy, sx + 1, sy + sz, lc);

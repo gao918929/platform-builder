@@ -1,8 +1,10 @@
 package com.pingtai.platformbuilder.screen;
 
+import com.google.gson.JsonArray;
 import com.google.gson.JsonObject;
 import com.google.gson.JsonParser;
 import com.mojang.blaze3d.systems.RenderSystem;
+import com.pingtai.platformbuilder.blockentity.PlatformBuilderBlockEntity;
 import com.pingtai.platformbuilder.network.ModMessages;
 import com.pingtai.platformbuilder.network.BuildPlatformPacket;
 import com.pingtai.platformbuilder.network.ExtractAllPacket;
@@ -14,20 +16,20 @@ import net.minecraft.client.Minecraft;
 import net.minecraft.client.gui.GuiGraphics;
 import net.minecraft.client.gui.components.Button;
 import net.minecraft.client.gui.screens.inventory.AbstractContainerScreen;
+import net.minecraft.client.renderer.texture.TextureAtlas;
+import net.minecraft.client.renderer.texture.TextureAtlasSprite;
 import net.minecraft.core.BlockPos;
+import net.minecraft.core.Direction;
+import net.minecraft.core.registries.BuiltInRegistries;
 import net.minecraft.network.chat.Component;
 import net.minecraft.resources.ResourceLocation;
+import net.minecraft.util.RandomSource;
 import net.minecraft.world.entity.player.Inventory;
-import net.minecraft.world.inventory.Slot;
+
 import net.minecraft.world.item.BlockItem;
 import net.minecraft.world.item.ItemStack;
 import net.minecraft.world.level.block.Block;
-import net.minecraftforge.registries.ForgeRegistries;
 
-import java.net.URI;
-import java.net.http.HttpClient;
-import java.net.http.HttpRequest;
-import java.net.http.HttpResponse;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.util.*;
@@ -47,16 +49,21 @@ public class PlatformBuilderScreen extends AbstractContainerScreen<PlatformBuild
 
     private enum Mode { NORMAL, COPY, PASTE, REPLACE }
     private Mode mode = Mode.NORMAL;
-    private String replaceFrom;
-
     private static final String[] PATTERN_NAMES = {
-        "棋盘格", "横条纹", "竖条纹", "边框", "L↖", "L↗", "L↙", "L↘", "十字", "马路", "随机"
+        "棋盘格", "横条纹", "竖条纹", "边框", "L↖", "L↗", "L↙", "L↘", "十字", "马路", "马路竖", "随机"
     };
     private int popM1Idx, popM2Idx;
     private int patternIdx;
     private Button offsetResetBtn;
+    private Button scanBtn, copyBtn, pasteBtn, genBtn, aiBtn, buildBtn;
     private boolean showPatternPopup;
     private int selectedPattern = -1;
+    private boolean showImportPopup;
+    private List<String> importFiles = new ArrayList<>();
+    private int importScroll;
+    private int selectedImportFile = -1;
+    private boolean showExportPopup;
+    private String exportName = "";
 
     private static final int TB_Y = 6, TB_H = 22;
     private static final int GRID_X = 8, GRID_Y = 32, GRID_H = 140, GRID_W = 322;
@@ -64,19 +71,18 @@ public class PlatformBuilderScreen extends AbstractContainerScreen<PlatformBuild
     private static final int DESIGN_H = 220;
     private static final int INVENTORY_H = 188;
 
-    // State
     private boolean inventoryMode;
 
-    // Design-mode state
     private Tool tool = Tool.BRUSH;
     private String selectedMaterial;
     private final List<String> materials = new ArrayList<>();
+    private final Map<String, TextureAtlasSprite> matSprites = new LinkedHashMap<>();
     private final Map<String, ItemStack> matIcons = new LinkedHashMap<>();
     private final Map<String, Integer> matColors = new LinkedHashMap<>();
     private int matScroll;
     private float panX, panY, zoom = 1f;
     private static final float MIN_ZOOM = 0.2f, MAX_ZOOM = 5f;
-    private boolean panning, drawing;
+    private boolean panning, drawing, wasPanning;
     private BlockPos lastDraw, toolStart, toolEnd;
     private boolean showChunks = true;
     private BlockPos lastClickPos;
@@ -85,47 +91,43 @@ public class PlatformBuilderScreen extends AbstractContainerScreen<PlatformBuild
     private int lastScannedOffsetY = Integer.MIN_VALUE;
     private Map<BlockPos, String> clipboard;
     private BlockPos clipboardOrigin;
+    private int clipCenterX, clipCenterZ;
     private final Deque<Map<BlockPos, String>> undoStack = new ArrayDeque<>();
     private static final int MAX_UNDO = 50;
+    private boolean designDirty = false;
 
-    // Toolbar hit areas
     private final int[] toolBtnX = new int[Tool.values().length];
     private int undoCX, clearCX, chunkCX, matStartX;
     private int tby;
 
     public PlatformBuilderScreen(PlatformBuilderMenu menu, Inventory inv, Component title) {
         super(menu, inv, title);
-        imageWidth = 338;
+        imageWidth = 362;
         imageHeight = DESIGN_H;
     }
-
-    // ==================== INIT ====================
 
     @Override
     protected void init() {
         imageHeight = inventoryMode ? INVENTORY_H : DESIGN_H;
         super.init();
 
-        if (menu.blockEntity.getDesign() != null)
-            design.putAll(menu.blockEntity.getDesign());
+        if (design.isEmpty() && getBE() != null && getBE().getDesign() != null) {
+            design.putAll(getBE().getDesign());
+        }
 
         if (inventoryMode) {
-            repositionSlotsForInventory();
             buildInventoryWidgets();
         } else {
-            hideSlots();
             buildDesignWidgets();
             refreshMaterials();
         }
     }
 
     private void buildDesignWidgets() {
-        // Mode toggle
         addRenderableWidget(Button.builder(
                 Component.literal("放入"), b -> switchToInventoryMode()
         ).pos(leftPos + 8, topPos + TB_Y + 2).size(36, 18).build());
 
-        // Speed control
         int spdY = topPos + 198;
         addRenderableWidget(Button.builder(
                 Component.literal("-"), b -> changeSpeed(-10)
@@ -135,104 +137,109 @@ public class PlatformBuilderScreen extends AbstractContainerScreen<PlatformBuild
                 Component.literal("+"), b -> changeSpeed(10)
         ).pos(leftPos + 23, spdY).size(14, 20).build());
 
-        // Y-offset control
         addRenderableWidget(Button.builder(
                 Component.literal("-"), b -> changeOffset(-1)
         ).pos(leftPos + 90, spdY).size(14, 20).build());
 
         offsetResetBtn = addRenderableWidget(Button.builder(
-                Component.literal(String.valueOf(menu.blockEntity.getBuildOffsetY())), b -> changeOffsetTo(0)
+                Component.literal(String.valueOf(getBuildOffsetY())), b -> changeOffsetTo(0)
         ).pos(leftPos + 105, spdY).size(14, 20).build());
 
         addRenderableWidget(Button.builder(
                 Component.literal("+"), b -> changeOffset(1)
         ).pos(leftPos + 120, spdY).size(14, 20).build());
 
-        // Scan, copy, paste, replace, generate, AI buttons
         addRenderableWidget(Button.builder(
                 Component.literal("扫描"), b -> scanExistingBlocks()
         ).pos(leftPos + 142, spdY).size(24, 20).build());
 
         addRenderableWidget(Button.builder(
-                Component.literal("复制"), b -> { mode = Mode.COPY; tool = Tool.RECT; selectedMaterial = null; }
+                Component.literal("复制"), b -> { mode = mode == Mode.COPY ? Mode.NORMAL : Mode.COPY; if (mode == Mode.COPY) { tool = Tool.RECT; selectedMaterial = null; } }
         ).pos(leftPos + 168, spdY).size(24, 20).build());
 
         addRenderableWidget(Button.builder(
-                Component.literal("粘贴"), b -> { if (clipboard != null && !clipboard.isEmpty()) mode = Mode.PASTE; }
+                Component.literal("粘贴"), b -> { mode = mode == Mode.PASTE ? Mode.NORMAL : (clipboard != null && !clipboard.isEmpty() ? Mode.PASTE : Mode.NORMAL); }
         ).pos(leftPos + 194, spdY).size(24, 20).build());
 
         addRenderableWidget(Button.builder(
-                Component.literal("替换"), b -> { mode = Mode.REPLACE; replaceFrom = null; }
-        ).pos(leftPos + 220, spdY).size(24, 20).build());
+                Component.literal("导出"), b -> {
+                    if (clipboard == null || clipboard.isEmpty()) return;
+                    showExportPopup = true;
+                    exportName = "";
+                }
+        ).pos(leftPos + 220, spdY).size(22, 20).build());
+
+        addRenderableWidget(Button.builder(
+                Component.literal("导入"), b -> {
+                    showImportPopup = true; selectedImportFile = -1;
+                    loadImportFileList();
+                }
+        ).pos(leftPos + 244, spdY).size(22, 20).build());
+
+        addRenderableWidget(Button.builder(
+                Component.literal("替换"), b -> { mode = mode == Mode.REPLACE ? Mode.NORMAL : Mode.REPLACE; }
+        ).pos(leftPos + 268, spdY).size(24, 20).build());
 
         addRenderableWidget(Button.builder(
                 Component.literal("生成"), b -> {
                     showPatternPopup = true; selectedPattern = -1;
                     popM1Idx = 0; popM2Idx = Math.min(1, materials.size() - 1);
                 }
-        ).pos(leftPos + 246, spdY).size(24, 20).build());
+        ).pos(leftPos + 294, spdY).size(24, 20).build());
 
-        addRenderableWidget(Button.builder(
-                Component.literal("AI"), b -> aiGenerate()
-        ).pos(leftPos + 272, spdY).size(22, 20).build());
-
-        // Build button
         addRenderableWidget(Button.builder(
                 Component.translatable("gui.platformbuilder.build"), b -> {
                     sendDesign();
-                    ModMessages.sendToServer(new BuildPlatformPacket(menu.blockEntity.getBlockPos()));
+                    ModMessages.sendToServer(new BuildPlatformPacket(getBEPos()));
                 }
-        ).pos(leftPos + 298, spdY).size(32, 20).build());
+        ).pos(leftPos + 320, spdY).size(32, 20).build());
     }
 
     private void changeSpeed(int delta) {
-        int newSpeed = menu.blockEntity.getBuildSpeed() + delta;
-        menu.blockEntity.setBuildSpeed(newSpeed);
-        ModMessages.sendToServer(new SetSpeedPacket(menu.blockEntity.getBlockPos(), newSpeed));
+        int newSpeed = getBuildSpeed() + delta;
+        setBuildSpeed(newSpeed);
+        ModMessages.sendToServer(new SetSpeedPacket(getBEPos(), newSpeed));
     }
 
     private void changeOffset(int delta) {
-        int newOff = menu.blockEntity.getBuildOffsetY() + delta;
-        menu.blockEntity.setBuildOffsetY(newOff);
-        ModMessages.sendToServer(new SetOffsetPacket(menu.blockEntity.getBlockPos(), newOff));
+        int newOff = getBuildOffsetY() + delta;
+        setBuildOffsetY(newOff);
+        ModMessages.sendToServer(new SetOffsetPacket(getBEPos(), newOff));
         if (offsetResetBtn != null) offsetResetBtn.setMessage(Component.literal(String.valueOf(newOff)));
     }
 
     private void changeOffsetTo(int value) {
-        menu.blockEntity.setBuildOffsetY(value);
-        ModMessages.sendToServer(new SetOffsetPacket(menu.blockEntity.getBlockPos(), value));
+        setBuildOffsetY(value);
+        ModMessages.sendToServer(new SetOffsetPacket(getBEPos(), value));
         if (offsetResetBtn != null) offsetResetBtn.setMessage(Component.literal(String.valueOf(value)));
     }
 
     private void buildInventoryWidgets() {
         int rowY = topPos + 4;
-        // Mode toggle
         addRenderableWidget(Button.builder(
                 Component.literal("设计"), b -> switchToDesignMode()
         ).pos(leftPos + 8, rowY).size(36, 18).build());
 
-        // Quick load
         addRenderableWidget(Button.builder(
                 Component.literal("→ 放入全部"), b ->
-                ModMessages.sendToServer(new QuickLoadPacket(menu.blockEntity.getBlockPos()))
+                ModMessages.sendToServer(new QuickLoadPacket(getBEPos()))
         ).pos(leftPos + 50, rowY).size(80, 18).build());
 
-        // Extract all
         addRenderableWidget(Button.builder(
                 Component.literal("← 取出全部"), b ->
-                ModMessages.sendToServer(new ExtractAllPacket(menu.blockEntity.getBlockPos()))
+                ModMessages.sendToServer(new ExtractAllPacket(getBEPos()))
         ).pos(leftPos + 136, rowY).size(80, 18).build());
 
-        // Build button
         addRenderableWidget(Button.builder(
                 Component.translatable("gui.platformbuilder.build"), b -> {
                     sendDesign();
-                    ModMessages.sendToServer(new BuildPlatformPacket(menu.blockEntity.getBlockPos()));
+                    ModMessages.sendToServer(new BuildPlatformPacket(getBEPos()));
                 }
         ).pos(leftPos + 222, rowY).size(100, 18).build());
     }
 
     private void switchToInventoryMode() {
+        if (designDirty) sendDesign();
         inventoryMode = true;
         resetWidgets();
         init();
@@ -249,38 +256,256 @@ public class PlatformBuilderScreen extends AbstractContainerScreen<PlatformBuild
         this.children().clear();
     }
 
-    private void repositionSlotsForInventory() {
-        // Machine slots (0-26)
-        for (int row = 0; row < 3; row++) {
-            for (int col = 0; col < 9; col++) {
-                Slot slot = menu.slots.get(col + row * 9);
-                slot.x = 8 + col * 18;
-                slot.y = PlatformBuilderMenu.MACHINE_Y + row * 18;
+    private void copySelection() {
+        clipboard = null;
+        clipboardOrigin = null;
+        if (tool == Tool.RECT && toolStart != null && toolEnd != null) {
+            int mnX = Math.min(toolStart.getX(), toolEnd.getX());
+            int mxX = Math.max(toolStart.getX(), toolEnd.getX());
+            int mnZ = Math.min(toolStart.getZ(), toolEnd.getZ());
+            int mxZ = Math.max(toolStart.getZ(), toolEnd.getZ());
+            clipboard = new LinkedHashMap<>();
+            clipboardOrigin = new BlockPos(mnX, 0, mnZ);
+            for (int x = mnX; x <= mxX; x++) {
+                for (int z = mnZ; z <= mxZ; z++) {
+                    BlockPos p = new BlockPos(x, 0, z);
+                    String mat = design.get(p);
+                    if (mat == null) mat = existingBlocks.get(p);
+                    if (mat != null)
+                        clipboard.put(new BlockPos(x - mnX, 0, z - mnZ), mat);
+                }
             }
-        }
-        // Player main (27-53)
-        for (int row = 0; row < 3; row++) {
-            for (int col = 0; col < 9; col++) {
-                Slot slot = menu.slots.get(27 + col + row * 9);
-                slot.x = 8 + col * 18;
-                slot.y = PlatformBuilderMenu.PLAYER_MAIN_Y + row * 18;
-            }
-        }
-        // Hotbar (54-62)
-        for (int col = 0; col < 9; col++) {
-            Slot slot = menu.slots.get(54 + col);
-            slot.x = 8 + col * 18;
-            slot.y = PlatformBuilderMenu.PLAYER_HOTBAR_Y;
+            clipCenterX = (mxX - mnX) / 2;
+            clipCenterZ = (mxZ - mnZ) / 2;
         }
     }
 
-    private void hideSlots() {
-        for (Slot slot : menu.slots) {
-            slot.y = 999;
+    private void pasteClipboard() {
+        if (clipboard == null || clipboard.isEmpty()) return;
+        BlockPos anchor = toolStart != null ? toolStart : lastClickPos;
+        if (anchor == null) return;
+        saveUndo();
+        for (var entry : clipboard.entrySet()) {
+            BlockPos target = anchor.offset(entry.getKey().getX() - clipCenterX, 0, entry.getKey().getZ() - clipCenterZ);
+            if (!design.containsKey(target))
+                design.put(target, entry.getValue());
+        }
+        designDirty = true;
+    }
+
+    private void exportClipboard(String name) {
+        if (clipboard == null || clipboard.isEmpty()) return;
+        try {
+            Path dir = Minecraft.getInstance().gameDirectory.toPath().resolve("platformbuilder").resolve("exports");
+            Files.createDirectories(dir);
+            String fname = (name != null && !name.isEmpty()) ? name + ".json" : ("design_" + System.currentTimeMillis() + ".json");
+            Path file = dir.resolve(fname);
+            JsonObject json = new JsonObject();
+            JsonArray blocks = new JsonArray();
+            int mnX = Integer.MAX_VALUE, mxX = Integer.MIN_VALUE;
+            int mnZ = Integer.MAX_VALUE, mxZ = Integer.MIN_VALUE;
+            for (var entry : clipboard.entrySet()) {
+                JsonObject b = new JsonObject();
+                int x = entry.getKey().getX(), z = entry.getKey().getZ();
+                b.addProperty("x", x);
+                b.addProperty("z", z);
+                b.addProperty("block", entry.getValue());
+                blocks.add(b);
+                mnX = Math.min(mnX, x); mxX = Math.max(mxX, x);
+                mnZ = Math.min(mnZ, z); mxZ = Math.max(mxZ, z);
+            }
+            json.add("blocks", blocks);
+            json.addProperty("width", mxX - mnX + 1);
+            json.addProperty("height", mxZ - mnZ + 1);
+            Files.writeString(file, new com.google.gson.GsonBuilder().setPrettyPrinting().create().toJson(json));
+            if (minecraft.player != null)
+                minecraft.player.displayClientMessage(Component.literal("已导出: " + file.getFileName().toString()), false);
+        } catch (Exception e) {
+            if (minecraft.player != null)
+                minecraft.player.displayClientMessage(Component.literal("导出失败"), false);
         }
     }
 
-    // ==================== BG RENDER ====================
+    private void doExportNamed() {
+        String name = exportName.trim();
+        if (name.isEmpty()) name = null;
+        exportClipboard(name);
+        showExportPopup = false;
+    }
+
+    private void handleExportNameClick(int mx, int my, int btn) {
+        if (btn != 0) return;
+        int pw = 260, ph = 80;
+        int px = (width - pw) / 2, py = (height - ph) / 2;
+        if (mx >= px + pw - 20 && mx < px + pw - 4 && my >= py + 4 && my < py + 20) {
+            showExportPopup = false; return;
+        }
+        int okX = px + pw - 50, okY = py + ph - 24;
+        if (mx >= okX && mx < okX + 42 && my >= okY && my < okY + 18) {
+            doExportNamed();
+        }
+    }
+
+    private void renderExportNamePopup(GuiGraphics g) {
+        int pw = 260, ph = 80;
+        int px = (width - pw) / 2, py = (height - ph) / 2;
+        g.fill(px, py, px + pw, py + ph, 0xE8202020);
+        drawBorder(g, px, py, pw, ph);
+        g.drawCenteredString(font, Component.literal("导出设计"), px + pw / 2, py + 6, 0xFFFFFFFF);
+        g.drawString(font, Component.literal("✕"), px + pw - 18, py + 6, 0xFFFF6666, false);
+
+        int boxX = px + 10, boxY = py + 26, boxW = pw - 20, boxH = 16;
+        g.fill(boxX - 1, boxY - 1, boxX + boxW + 1, boxY + boxH + 1, 0xFFFFFFFF);
+        g.fill(boxX, boxY, boxX + boxW, boxY + boxH, 0xFF000000);
+        String display = exportName + ((System.currentTimeMillis() / 500) % 2 == 0 ? "|" : " ");
+        String text = display.length() > 35 ? display.substring(display.length() - 35) : display;
+        g.drawString(font, Component.literal(text), boxX + 3, boxY + 4, 0xFFFFFFFF, false);
+
+        int okX = px + pw - 50, okY = py + ph - 24;
+        boolean canOk = !exportName.trim().isEmpty();
+        g.fill(okX, okY, okX + 42, okY + 18, canOk ? 0xFF446644 : 0xFF444444);
+        g.drawCenteredString(font, Component.literal("确定"), okX + 21, okY + 5, 0xFFFFFFFF);
+    }
+
+    private void loadImportFileList() {
+        importFiles.clear();
+        try {
+            Path dir = Minecraft.getInstance().gameDirectory.toPath().resolve("platformbuilder").resolve("exports");
+            if (Files.exists(dir)) {
+                try (var stream = Files.list(dir)) {
+                    stream.filter(p -> p.toString().endsWith(".json"))
+                          .sorted(java.util.Comparator.reverseOrder())
+                          .forEach(p -> importFiles.add(p.getFileName().toString()));
+                }
+            }
+        } catch (Exception ignored) {}
+    }
+
+    private void doImport(int idx) {
+        if (idx < 0 || idx >= importFiles.size()) return;
+        try {
+            Path dir = Minecraft.getInstance().gameDirectory.toPath().resolve("platformbuilder").resolve("exports");
+            Path file = dir.resolve(importFiles.get(idx));
+            String raw = Files.readString(file);
+            JsonObject json = JsonParser.parseString(raw).getAsJsonObject();
+            JsonArray blocks = json.getAsJsonArray("blocks");
+            clipboard = new LinkedHashMap<>();
+            int mnX = Integer.MAX_VALUE, mxX = Integer.MIN_VALUE;
+            int mnZ = Integer.MAX_VALUE, mxZ = Integer.MIN_VALUE;
+            for (var elem : blocks) {
+                JsonObject b = elem.getAsJsonObject();
+                int x = b.get("x").getAsInt();
+                int z = b.get("z").getAsInt();
+                String block = b.get("block").getAsString();
+                clipboard.put(new BlockPos(x, 0, z), block);
+                mnX = Math.min(mnX, x); mxX = Math.max(mxX, x);
+                mnZ = Math.min(mnZ, z); mxZ = Math.max(mxZ, z);
+            }
+            clipCenterX = (mxX - mnX) / 2;
+            clipCenterZ = (mxZ - mnZ) / 2;
+            toolStart = null; toolEnd = null;
+            mode = Mode.PASTE;
+            if (minecraft.player != null)
+                minecraft.player.displayClientMessage(Component.literal("已导入: " + importFiles.get(idx) + "，点击网格放置"), false);
+        } catch (Exception e) {
+            if (minecraft.player != null)
+                minecraft.player.displayClientMessage(Component.literal("导入失败"), false);
+        }
+        showImportPopup = false;
+    }
+
+    private void handleImportClick(int mx, int my) {
+        int pw = 260, ph = 200;
+        int px = (width - pw) / 2, py = (height - ph) / 2;
+        if (mx >= px + pw - 20 && mx < px + pw - 4 && my >= py + 4 && my < py + 20) {
+            showImportPopup = false; return;
+        }
+        int listY = py + 28;
+        int itemH = 18;
+        int visible = Math.min(importFiles.size(), 8);
+        int maxScroll = Math.max(0, importFiles.size() - visible);
+        for (int i = 0; i < visible && i + importScroll < importFiles.size(); i++) {
+            int iy = listY + i * itemH;
+            if (mx >= px + 8 && mx < px + pw - 24 && my >= iy && my < iy + itemH) {
+                selectedImportFile = i + importScroll; return;
+            }
+        }
+        if (maxScroll > 0) {
+            if (mx >= px + pw - 16 && mx < px + pw - 4 && my >= listY && my < listY + 80) {
+                importScroll = Math.min(importScroll + 1, maxScroll); return;
+            }
+            if (mx >= px + pw - 16 && mx < px + pw - 4 && my >= listY + 80 && my < listY + visible * itemH) {
+                importScroll = Math.max(importScroll - 1, 0); return;
+            }
+        }
+        int btnY = py + ph - 24;
+        if (mx >= px + pw - 50 && mx < px + pw - 8 && my >= btnY && my < btnY + 18) {
+            if (selectedImportFile >= 0) doImport(selectedImportFile);
+            showImportPopup = false;
+        }
+    }
+
+    private void renderImportPopup(GuiGraphics g) {
+        int pw = 260, ph = 200;
+        int px = (width - pw) / 2, py = (height - ph) / 2;
+        g.fill(px, py, px + pw, py + ph, 0xE8202020);
+        drawBorder(g, px, py, pw, ph);
+        g.drawCenteredString(font, Component.literal("导入设计"), px + pw / 2, py + 6, 0xFFFFFFFF);
+        g.drawString(font, Component.literal("✕"), px + pw - 18, py + 6, 0xFFFF6666, false);
+
+        int listY = py + 28;
+        int itemH = 18;
+        int visible = Math.min(importFiles.size(), 8);
+        int maxScroll = Math.max(0, importFiles.size() - visible);
+        if (importFiles.isEmpty()) {
+            g.drawCenteredString(font, Component.literal("无导出文件"), px + pw / 2, py + 80, 0xFF888888);
+        } else {
+            for (int i = 0; i < visible && i + importScroll < importFiles.size(); i++) {
+                int idx = i + importScroll;
+                String name = importFiles.get(idx);
+                int iy = listY + i * itemH;
+                if (idx == selectedImportFile)
+                    g.fill(px + 8, iy, px + pw - 24, iy + itemH, 0x40FFFFFF);
+                String display = name.length() > 28 ? name.substring(0, 27) + "..." : name;
+                g.drawString(font, Component.literal(display), px + 12, iy + 5, 0xFFFFFFFF, false);
+            }
+            if (maxScroll > 0) {
+                g.fill(px + pw - 16, listY, px + pw - 4, listY + 80, 0x80555555);
+                g.drawString(font, Component.literal("▼"), px + pw - 15, listY + 2, 0xFFFFFFFF, false);
+                g.fill(px + pw - 16, listY + 80, px + pw - 4, listY + visible * itemH, 0x80555555);
+                g.drawString(font, Component.literal("▲"), px + pw - 15, listY + 80 + 2, 0xFFFFFFFF, false);
+            }
+        }
+
+        int btnY = py + ph - 24;
+        int btnX = px + pw - 50;
+        g.fill(btnX, btnY, btnX + 42, btnY + 18, selectedImportFile >= 0 ? 0xFF446644 : 0xFF444444);
+        g.drawCenteredString(font, Component.literal("确定"), btnX + 21, btnY + 5, 0xFFFFFFFF);
+    }
+
+    private void scanExistingBlocks() {
+        existingBlocks.clear();
+        if (minecraft == null || minecraft.level == null || getBE() == null) return;
+
+        BlockPos machinePos = getBEPos();
+        int offsetY = getBuildOffsetY();
+        int scanY = machinePos.getY() + offsetY;
+        lastScannedOffsetY = offsetY;
+
+        var level = minecraft.level;
+        int range = 48;
+        for (int dx = -range; dx <= range; dx++) {
+            for (int dz = -range; dz <= range; dz++) {
+                var state = level.getBlockState(new BlockPos(machinePos.getX() + dx, scanY, machinePos.getZ() + dz));
+                if (!state.isAir()) {
+                    var id = BuiltInRegistries.BLOCK.getKey(state.getBlock());
+                    if (id != null) {
+                        existingBlocks.put(new BlockPos(dx, 0, dz), id.toString());
+                    }
+                }
+            }
+        }
+    }
 
     @Override
     protected void renderBg(GuiGraphics g, float pt, int mx, int my) {
@@ -298,11 +523,9 @@ public class PlatformBuilderScreen extends AbstractContainerScreen<PlatformBuild
     private void renderDesignBg(GuiGraphics g, int mx, int my) {
         tby = topPos + TB_Y;
 
-        // Toolbar bg (tools only, no materials)
         g.fill(leftPos + 46, tby - 2, leftPos + imageWidth - 4, tby + TB_H + 2, 0x80222222);
         hline(g, leftPos + 46, leftPos + imageWidth - 4, tby + TB_H + 3, 0xFF555555);
 
-        // Grid bg
         int gy = topPos + GRID_Y;
         g.fill(leftPos + GRID_X - 1, gy - 1, leftPos + GRID_X + GRID_W + 1, gy + GRID_H + 1, 0xFF222222);
         g.fill(leftPos + GRID_X, gy, leftPos + GRID_X + GRID_W, gy + GRID_H, 0xFFD4CFC9);
@@ -313,12 +536,10 @@ public class PlatformBuilderScreen extends AbstractContainerScreen<PlatformBuild
         renderGrid(g, mx, my);
         g.disableScissor();
 
-        // Material palette below grid
         renderMaterialPalette(g, mx, my);
 
-        // Speed & offset display
-        int spd = menu.blockEntity.getBuildSpeed();
-        int off = menu.blockEntity.getBuildOffsetY();
+        int spd = getBuildSpeed();
+        int off = getBuildOffsetY();
         g.drawString(font, Component.literal("速度:" + spd), leftPos + 40, topPos + 200, 0xFFAAAAAA, false);
         g.drawString(font, Component.literal("Y:" + (off >= 0 ? "+" : "") + off),
                 leftPos + 136, topPos + 200, 0xFFAAAAAA, false);
@@ -332,11 +553,9 @@ public class PlatformBuilderScreen extends AbstractContainerScreen<PlatformBuild
         if (matScroll > maxScroll) matScroll = maxScroll;
         if (matScroll < 0) matScroll = 0;
 
-        // Label
         g.drawString(font, Component.literal("材料"), x, palY, 0xFFAAAAAA, false);
         x += 24;
 
-        // Scroll left arrow
         if (matScroll > 0) {
             g.fill(x, palY, x + 10, palY + 18, 0x80555555);
             g.drawString(font, Component.literal("<"), x + 2, palY + 5, 0xFFFFFFFF, false);
@@ -344,7 +563,6 @@ public class PlatformBuilderScreen extends AbstractContainerScreen<PlatformBuild
         }
         matStartX = x;
 
-        // Material icons
         for (int i = 0; i < 12 && i + matScroll < materials.size(); i++) {
             String mat = materials.get(i + matScroll);
             boolean sel = mat.equals(selectedMaterial);
@@ -354,7 +572,6 @@ public class PlatformBuilderScreen extends AbstractContainerScreen<PlatformBuild
             x += 22;
         }
 
-        // Scroll right arrow
         if (matScroll < maxScroll) {
             g.fill(x, palY, x + 10, palY + 18, 0x80555555);
             g.drawString(font, Component.literal(">"), x + 2, palY + 5, 0xFFFFFFFF, false);
@@ -362,14 +579,12 @@ public class PlatformBuilderScreen extends AbstractContainerScreen<PlatformBuild
     }
 
     private void renderInventoryBg(GuiGraphics g) {
-        // Machine inventory section
         int machineTop = topPos + 24;
         int machineBottom = topPos + 90;
         g.fill(leftPos + 6, machineTop, leftPos + imageWidth - 6, machineBottom, 0x80181818);
         hline(g, leftPos + 6, leftPos + imageWidth - 6, machineBottom, 0xFF555555);
         g.drawString(font, Component.literal("材料库存"), leftPos + 8, machineTop + 2, 0xFFAAAAAA, false);
 
-        // Player inventory section
         int playerTop = topPos + 92;
         int playerBottom = topPos + 184;
         g.fill(leftPos + 6, playerTop, leftPos + imageWidth - 6, playerBottom, 0x80181818);
@@ -380,17 +595,25 @@ public class PlatformBuilderScreen extends AbstractContainerScreen<PlatformBuild
     @Override
     public void render(GuiGraphics g, int mx, int my, float pt) {
         if (!inventoryMode) refreshMaterials();
+
+        if (inventoryMode) {
+            super.render(g, mx, my, pt);
+            return;
+        }
+
         renderBackground(g);
+        renderBg(g, pt, mx, my);
 
-        if (!inventoryMode) {
-            g.enableScissor(leftPos, topPos, leftPos + imageWidth, topPos + imageHeight);
-        }
-        super.render(g, mx, my, pt);
-        if (!inventoryMode) {
-            g.disableScissor();
+        for (var r : this.renderables)
+            r.render(g, mx, my, pt);
+
+        if (!this.menu.getCarried().isEmpty()) {
+            ItemStack cs = this.menu.getCarried();
+            g.renderItem(cs, mx - 8, my - 8);
+            g.renderItemDecorations(this.font, cs, mx - 8, my - 8);
         }
 
-        if (!inventoryMode && isInGrid(mx, my) && tool != Tool.RECT) {
+        if (isInGrid(mx, my) && tool != Tool.RECT) {
             BlockPos p = screenToGrid(mx, my);
             if (p != null) {
                 String dMat = design.get(p);
@@ -407,21 +630,21 @@ public class PlatformBuilderScreen extends AbstractContainerScreen<PlatformBuild
             }
         }
 
-        if (!inventoryMode && mode != Mode.NORMAL)
+        if (mode != Mode.NORMAL)
             g.drawString(font, Component.literal(switch (mode) {
                 case COPY -> "复制模式(拖拽框选)";
                 case PASTE -> "粘贴模式(点击放置, Esc取消)";
-                case REPLACE -> replaceFrom == null ? "替换模式(点击要替换的方块)" : "替换模式(点击新材料完成替换)";
+                case REPLACE -> "替换模式(只覆盖已有方块, Esc取消)";
                 default -> "";
             }), leftPos + 8, topPos + imageHeight - 12, 0xFFFFFF88, false);
 
         if (showPatternPopup) renderPopup(g);
+        if (showImportPopup) renderImportPopup(g);
+        if (showExportPopup) renderExportNamePopup(g);
     }
 
     @Override
     protected void renderLabels(GuiGraphics g, int mx, int my) {}
-
-    // ==================== TOOLBAR (design mode only) ====================
 
     private void renderToolbar(GuiGraphics g) {
         int x = leftPos + 52;
@@ -461,8 +684,6 @@ public class PlatformBuilderScreen extends AbstractContainerScreen<PlatformBuild
         g.drawCenteredString(font, Component.literal(text), x + BTN_W / 2, y + BTN_H / 2 - 4, fg);
     }
 
-    // ==================== GRID (design mode only) ====================
-
     private void renderGrid(GuiGraphics g, int mx, int my) {
         float es = 16f * zoom;
         int cx = leftPos + GRID_X + GRID_W / 2 + (int) panX;
@@ -473,7 +694,7 @@ public class PlatformBuilderScreen extends AbstractContainerScreen<PlatformBuild
         int sZ = (int) Math.floor((topPos + GRID_Y - cy) / es) - 1;
         int eZ = (int) Math.ceil((topPos + GRID_Y + GRID_H - cy) / es) + 1;
 
-        BlockPos wp = menu.blockEntity.getBlockPos();
+        BlockPos wp = getBEPos();
         int wx = wp.getX(), wz = wp.getZ();
 
         int rmx = 0, rMx = -1, rmz = 0, rMz = -1;
@@ -502,14 +723,10 @@ public class PlatformBuilderScreen extends AbstractContainerScreen<PlatformBuild
                 String mat = design.get(key);
 
                 if (mat != null) {
-                    if (es >= 8) {
-                        ItemStack icon = matIcons.get(mat);
-                        if (icon != null)
-                            g.renderItem(icon, sx + (sz - 16) / 2, sy + (sz - 16) / 2);
-                        else {
-                            Integer col = matColors.get(mat);
-                            g.fill(sx, sy, sx + sz - 1, sy + sz - 1, col != null ? col : 0xFF44AA44);
-                        }
+                    TextureAtlasSprite sprite = matSprites.get(mat);
+                    if (sprite != null && sz >= 2) {
+                        RenderSystem.setShaderTexture(0, TextureAtlas.LOCATION_BLOCKS);
+                        g.blit(sx, sy, 0, sz, sz, sprite);
                     } else {
                         Integer col = matColors.get(mat);
                         g.fill(sx, sy, sx + sz - 1, sy + sz - 1, col != null ? col : 0xFF44AA44);
@@ -519,7 +736,7 @@ public class PlatformBuilderScreen extends AbstractContainerScreen<PlatformBuild
                     if (existingMat != null) {
                         Integer col = matColors.get(existingMat);
                         if (col == null) {
-                            Block block = ForgeRegistries.BLOCKS.getValue(new ResourceLocation(existingMat));
+                            Block block = BuiltInRegistries.BLOCK.get(new ResourceLocation(existingMat));
                             if (block != null) {
                                 col = 0xFF000000 | block.defaultMapColor().col;
                                 matColors.put(existingMat, col);
@@ -583,19 +800,17 @@ public class PlatformBuilderScreen extends AbstractContainerScreen<PlatformBuild
             g.fill(cx + 4, cy + oz / 2 - 1, cx + oz - 4, cy + oz / 2 + 2, 0x90FF4444);
         }
 
-        ItemStack previewIcon = (selectedMaterial != null) ? matIcons.get(selectedMaterial) : null;
+        TextureAtlasSprite previewSprite = (selectedMaterial != null) ? matSprites.get(selectedMaterial) : null;
         Integer previewColor = (selectedMaterial != null) ? matColors.get(selectedMaterial) : null;
 
-        // Brush / Eraser hover cursor
         if (isInGrid(mx, my) && (tool == Tool.BRUSH || tool == Tool.ERASER) && !drawing) {
             BlockPos hp = screenToGrid(mx, my);
             if (hp != null) {
                 int hx = (int) (cx + hp.getX() * es), hy = (int) (cy + hp.getZ() * es);
                 int sz = Math.max(1, (int) es);
-                if (tool == Tool.BRUSH && sz >= 10 && previewIcon != null) {
-                    RenderSystem.setShaderColor(1f, 1f, 1f, 0.55f);
-                    g.renderItem(previewIcon, hx + (sz - 16) / 2, hy + (sz - 16) / 2);
-                    RenderSystem.setShaderColor(1f, 1f, 1f, 1f);
+                if (tool == Tool.BRUSH && sz >= 4 && previewSprite != null) {
+                    RenderSystem.setShaderTexture(0, TextureAtlas.LOCATION_BLOCKS);
+                    g.blit(hx, hy, 0, sz, sz, previewSprite);
                 } else if (tool == Tool.BRUSH && previewColor != null) {
                     g.fill(hx, hy, hx + sz - 1, hy + sz - 1, (previewColor & 0x00FFFFFF) | 0xB0000000);
                 }
@@ -607,39 +822,29 @@ public class PlatformBuilderScreen extends AbstractContainerScreen<PlatformBuild
             }
         }
 
-        // RECT fill preview
-        if (tool == Tool.RECT && toolStart != null && toolEnd != null && previewIcon != null) {
+        if (tool == Tool.RECT && toolStart != null && toolEnd != null && previewSprite != null) {
             int rmnX = Math.min(toolStart.getX(), toolEnd.getX());
             int rmX = Math.max(toolStart.getX(), toolEnd.getX());
             int rmnZ = Math.min(toolStart.getZ(), toolEnd.getZ());
             int rmZ = Math.max(toolStart.getZ(), toolEnd.getZ());
             if ((rmX - rmnX + 1) * (rmZ - rmnZ + 1) <= 2500) {
+                RenderSystem.setShaderTexture(0, TextureAtlas.LOCATION_BLOCKS);
                 for (int gx = rmnX; gx <= rmX; gx++) {
                     for (int gz = rmnZ; gz <= rmZ; gz++) {
                         int sx = (int) (cx + gx * es), sy = (int) (cy + gz * es);
-                        if (es >= 10) {
-                            RenderSystem.setShaderColor(1f, 1f, 1f, 0.5f);
-                            g.renderItem(previewIcon, sx + 1, sy + 1);
-                            RenderSystem.setShaderColor(1f, 1f, 1f, 1f);
-                        } else if (previewColor != null) {
-                            g.fill(sx, sy, sx + Math.max(1, (int) es) - 1, sy + Math.max(1, (int) es) - 1,
-                                    (previewColor & 0x00FFFFFF) | 0xB0000000);
-                        }
+                        g.blit(sx, sy, 0, Math.max(1, (int) es), Math.max(1, (int) es), previewSprite);
                     }
                 }
             }
         }
 
-        // Circle center marker
         if (tool == Tool.CIRCLE && toolStart != null) {
             int scx = (int)(cx + toolStart.getX() * es), scy = (int)(cy + toolStart.getZ() * es);
             int sz = Math.max(1, (int)es);
-            // Crosshair at center
             g.fill(scx + sz/2 - 1, scy + 2, scx + sz/2 + 2, scy + sz - 2, 0xCCAA66CC);
             g.fill(scx + 2, scy + sz/2 - 1, scx + sz - 2, scy + sz/2 + 2, 0xCCAA66CC);
         }
 
-        // Line endpoints
         if (tool == Tool.LINE && toolStart != null) {
             int lx = (int)(cx + toolStart.getX() * es), ly = (int)(cy + toolStart.getZ() * es);
             int lsz = Math.max(1, (int)es);
@@ -649,6 +854,7 @@ public class PlatformBuilderScreen extends AbstractContainerScreen<PlatformBuild
             g.fill(lx, ly + lsz - 2, lx + lsz, ly + lsz, 0xCC44AAAA);
         }
 
+        // Paste preview
         if (mode == Mode.PASTE && clipboard != null && !clipboard.isEmpty() && isInGrid(mx, my)) {
             BlockPos hover = screenToGrid(mx, my);
             if (hover != null) {
@@ -658,15 +864,16 @@ public class PlatformBuilderScreen extends AbstractContainerScreen<PlatformBuild
                     int px = (int) (cx + tp.getX() * es);
                     int py = (int) (cy + tp.getZ() * es);
                     int psz = Math.max(1, (int) es);
-                    ItemStack icon = matIcons.get(entry.getValue());
-                    if (icon != null && psz >= 10) {
+                    TextureAtlasSprite sprite = matSprites.get(entry.getValue());
+                    if (sprite != null && psz >= 2) {
+                        RenderSystem.setShaderTexture(0, TextureAtlas.LOCATION_BLOCKS);
                         RenderSystem.setShaderColor(1f, 1f, 1f, 0.35f);
-                        g.renderItem(icon, px + (psz - 16) / 2, py + (psz - 16) / 2);
+                        g.blit(px, py, 0, psz, psz, sprite);
                         RenderSystem.setShaderColor(1f, 1f, 1f, 1f);
                     } else {
                         Integer col = matColors.get(entry.getValue());
                         if (col == null) {
-                            Block block = ForgeRegistries.BLOCKS.getValue(new ResourceLocation(entry.getValue()));
+                            Block block = BuiltInRegistries.BLOCK.get(new ResourceLocation(entry.getValue()));
                             if (block != null) {
                                 col = 0xFF000000 | block.defaultMapColor().col;
                                 matColors.put(entry.getValue(), col);
@@ -684,19 +891,32 @@ public class PlatformBuilderScreen extends AbstractContainerScreen<PlatformBuild
         }
     }
 
-    // ==================== INPUT ====================
+    // === INPUT ===
 
     @Override
     public boolean mouseClicked(double mx, double my, int btn) {
-        // Mode toggle button area — let the widget system handle it
+        wasPanning = false;
+        if (showPatternPopup) {
+            if (btn == 0 || btn == 1) handlePopupClick((int)mx, (int)my, btn);
+            return true;
+        }
+
+        if (showImportPopup) {
+            if (btn == 0) handleImportClick((int)mx, (int)my);
+            return true;
+        }
+
+        if (showExportPopup) {
+            handleExportNameClick((int)mx, (int)my, btn);
+            return true;
+        }
+
         int modeBtnX = leftPos + 8, modeBtnY = topPos + TB_Y + 2;
         if (!inventoryMode && btn == 0
                 && mx >= modeBtnX && mx < modeBtnX + 36
                 && my >= modeBtnY && my <= modeBtnY + 18) {
             return super.mouseClicked(mx, my, btn);
         }
-
-        if (showPatternPopup && btn == 0) { handlePopupClick((int)mx, (int)my); return true; }
         if (inventoryMode || (btn != 0 && btn != 2)) return super.mouseClicked(mx, my, btn);
 
         int toolbarY = tby + 2;
@@ -705,25 +925,20 @@ public class PlatformBuilderScreen extends AbstractContainerScreen<PlatformBuild
                 if (mx >= toolBtnX[i] && mx < toolBtnX[i] + BTN_W) { tool = Tool.values()[i]; return true; }
             }
             if (mx >= undoCX && mx < undoCX + BTN_W) { undo(); return true; }
-            if (mx >= clearCX && mx < clearCX + BTN_W) { saveUndo(); design.clear(); return true; }
+            if (mx >= clearCX && mx < clearCX + BTN_W) { saveUndo(); design.clear(); designDirty = true; return true; }
             if (mx >= chunkCX && mx < chunkCX + BTN_W) { showChunks = !showChunks; return true; }
             return true;
         }
 
-        // Material palette below grid
         int palY = topPos + 176;
         if (btn == 0 && my >= palY && my <= palY + 18) {
             int ix = matStartX;
-            // Left arrow
             if (matScroll > 0 && mx >= leftPos + 32 && mx < leftPos + 42) {
                 matScroll--; return true;
             }
             for (int i = 0; i < 12 && i + matScroll < materials.size(); i++) {
                 if (mx >= ix && mx < ix + 20) {
                     String mat = materials.get(i + matScroll);
-                    if (mode == Mode.REPLACE && replaceFrom != null) {
-                        doReplace(mat); mode = Mode.NORMAL; return true;
-                    }
                     selectedMaterial = mat.equals(selectedMaterial) ? null : mat;
                     return true;
                 }
@@ -740,15 +955,10 @@ public class PlatformBuilderScreen extends AbstractContainerScreen<PlatformBuild
                 pasteClipboard();
                 return true;
             }
-            if (mode == Mode.REPLACE && btn == 0) {
-                String mat = design.get(lastClickPos);
-                if (mat != null && replaceFrom == null) { replaceFrom = mat; return true; }
-                mode = Mode.NORMAL; return true;
-            }
             if (btn == 0) {
                 switch (tool) {
                     case BRUSH, ERASER -> {
-                        if (mode == Mode.COPY || mode == Mode.REPLACE) break;
+                        if (mode == Mode.COPY) break;
                         drawing = true; lastDraw = null; applyTool((int) mx, (int) my);
                     }
                     case RECT, CIRCLE, LINE -> { toolStart = screenToGrid((int) mx, (int) my); toolEnd = toolStart; }
@@ -764,7 +974,7 @@ public class PlatformBuilderScreen extends AbstractContainerScreen<PlatformBuild
     @Override
     public boolean mouseDragged(double mx, double my, int btn, double dx, double dy) {
         if (inventoryMode) return super.mouseDragged(mx, my, btn, dx, dy);
-        if (panning) { panX += (float) dx; panY += (float) dy; return true; }
+        if (panning) { wasPanning = true; panX += (float) dx; panY += (float) dy; return true; }
         if (drawing && isInGrid((int) mx, (int) my)) { applyTool((int) mx, (int) my); return true; }
         if ((tool == Tool.RECT || tool == Tool.CIRCLE || tool == Tool.LINE)
                 && toolStart != null && isInGrid((int) mx, (int) my)) {
@@ -780,6 +990,7 @@ public class PlatformBuilderScreen extends AbstractContainerScreen<PlatformBuild
         if (btn == 0) {
             if (drawing) { drawing = false; lastDraw = null; return true; }
             if (toolStart != null) {
+                if (wasPanning) { toolStart = null; toolEnd = null; return true; }
                 if (mode == Mode.COPY && tool == Tool.RECT) {
                     copySelection();
                     mode = Mode.PASTE;
@@ -798,10 +1009,10 @@ public class PlatformBuilderScreen extends AbstractContainerScreen<PlatformBuild
     }
 
     @Override
-    public boolean mouseScrolled(double mx, double my, double d) {
-        if (inventoryMode) return super.mouseScrolled(mx, my, d);
+    public boolean mouseScrolled(double mx, double my, double scrollY) {
+        if (inventoryMode) return super.mouseScrolled(mx, my, scrollY);
         if (isInGrid((int) mx, (int) my)) {
-            float nz = zoom * (d > 0 ? 1.10f : 0.91f);
+            float nz = zoom * (scrollY > 0 ? 1.10f : 0.91f);
             nz = Math.max(MIN_ZOOM, Math.min(MAX_ZOOM, nz));
             float cx = leftPos + GRID_X + GRID_W / 2f + panX;
             float cy = topPos + GRID_Y + GRID_H / 2f + panY;
@@ -810,19 +1021,35 @@ public class PlatformBuilderScreen extends AbstractContainerScreen<PlatformBuild
             panX += wx * (oe - ne); panY += wy * (oe - ne);
             zoom = nz; return true;
         }
-        return super.mouseScrolled(mx, my, d);
+        return super.mouseScrolled(mx, my, scrollY);
     }
 
     @Override
     public boolean keyPressed(int k, int s, int m) {
-        if (showPatternPopup || mode != Mode.NORMAL) {
-            if (k == 256) { mode = Mode.NORMAL; showPatternPopup = false; return true; }
+        if (showExportPopup) {
+            if (k == 256) { showExportPopup = false; return true; }
+            if (k == 257 || k == 335) { doExportNamed(); return true; }
+            if (k == 259) { if (!exportName.isEmpty()) exportName = exportName.substring(0, exportName.length() - 1); return true; }
+            return true;
+        }
+        if (showPatternPopup || showImportPopup || mode != Mode.NORMAL) {
+            if (k == 256) { mode = Mode.NORMAL; showPatternPopup = false; showImportPopup = false; return true; }
         }
         if (!inventoryMode && k == 90 && hasControlDown()) { undo(); return true; }
         return super.keyPressed(k, s, m);
     }
 
-    // ==================== ACTIONS ====================
+    @Override
+    public boolean charTyped(char ch, int mod) {
+        if (showExportPopup) {
+            if (ch >= ' ' && ch != 127 && exportName.length() < 40)
+                exportName += ch;
+            return true;
+        }
+        return super.charTyped(ch, mod);
+    }
+
+    // === ACTIONS ===
 
     private void applyTool(int mx, int my) {
         BlockPos p = screenToGrid(mx, my);
@@ -830,10 +1057,12 @@ public class PlatformBuilderScreen extends AbstractContainerScreen<PlatformBuild
         if (lastDraw == null) saveUndo();
         lastDraw = p;
         if (tool == Tool.BRUSH) {
+            if (mode == Mode.REPLACE && !design.containsKey(p)) return;
             if (selectedMaterial == null && !materials.isEmpty()) selectedMaterial = materials.get(0);
-            if (selectedMaterial != null) design.put(p, selectedMaterial);
+            if (selectedMaterial != null) { design.put(p, selectedMaterial); designDirty = true; }
         } else if (tool == Tool.ERASER) {
-            design.remove(p);
+            if (mode == Mode.REPLACE && !design.containsKey(p)) return;
+            design.remove(p); designDirty = true;
         }
     }
 
@@ -846,16 +1075,21 @@ public class PlatformBuilderScreen extends AbstractContainerScreen<PlatformBuild
 
     private void finishRect() {
         if (toolStart == null || toolEnd == null) return;
-        if (selectedMaterial == null) return; // keep selection for copy
+        if (selectedMaterial == null && !materials.isEmpty()) selectedMaterial = materials.get(0);
+        if (selectedMaterial == null) { toolStart = null; toolEnd = null; return; }
         saveUndo();
         int mnX = Math.min(toolStart.getX(), toolEnd.getX());
         int mxX = Math.max(toolStart.getX(), toolEnd.getX());
         int mnZ = Math.min(toolStart.getZ(), toolEnd.getZ());
         int mxZ = Math.max(toolStart.getZ(), toolEnd.getZ());
         for (int x = mnX; x <= mxX; x++)
-            for (int z = mnZ; z <= mxZ; z++)
-                design.put(new BlockPos(x, 0, z), selectedMaterial);
+            for (int z = mnZ; z <= mxZ; z++) {
+                BlockPos p = new BlockPos(x, 0, z);
+                if (mode == Mode.REPLACE && !design.containsKey(p)) continue;
+                design.put(p, selectedMaterial);
+            }
         toolStart = null; toolEnd = null;
+        designDirty = true;
     }
 
     private void finishCircle() {
@@ -866,13 +1100,16 @@ public class PlatformBuilderScreen extends AbstractContainerScreen<PlatformBuild
         int cx = toolStart.getX(), cz = toolStart.getZ();
         int dx = toolEnd.getX() - cx, dz = toolEnd.getZ() - cz;
         int r2 = dx * dx + dz * dz;
-        // Iterate bounding box of circle
         int r = (int) Math.ceil(Math.sqrt(r2));
         for (int x = cx - r; x <= cx + r; x++)
             for (int z = cz - r; z <= cz + r; z++)
-                if ((x - cx) * (x - cx) + (z - cz) * (z - cz) <= r2)
-                    design.put(new BlockPos(x, 0, z), selectedMaterial);
+                if ((x - cx) * (x - cx) + (z - cz) * (z - cz) <= r2) {
+                    BlockPos p = new BlockPos(x, 0, z);
+                    if (mode == Mode.REPLACE && !design.containsKey(p)) continue;
+                    design.put(p, selectedMaterial);
+                }
         toolStart = null; toolEnd = null;
+        designDirty = true;
     }
 
     private void finishLine() {
@@ -886,16 +1123,18 @@ public class PlatformBuilderScreen extends AbstractContainerScreen<PlatformBuild
         int sx = x1 < x2 ? 1 : -1, sz = z1 < z2 ? 1 : -1;
         int err = dx - dz;
         while (true) {
-            design.put(new BlockPos(x1, 0, z1), selectedMaterial);
+            BlockPos p = new BlockPos(x1, 0, z1);
+            if (mode != Mode.REPLACE || design.containsKey(p))
+                design.put(p, selectedMaterial);
             if (x1 == x2 && z1 == z2) break;
             int e2 = 2 * err;
             if (e2 > -dz) { err -= dz; x1 += sx; }
             if (e2 < dx)  { err += dx; z1 += sz; }
         }
         toolStart = null; toolEnd = null;
+        designDirty = true;
     }
 
-    /** Bresenham check: is (gx, gz) on the line between toolStart and toolEnd? */
     private boolean isOnLine(int gx, int gz) {
         int x1 = toolStart.getX(), z1 = toolStart.getZ();
         int x2 = toolEnd.getX(), z2 = toolEnd.getZ();
@@ -919,28 +1158,29 @@ public class PlatformBuilderScreen extends AbstractContainerScreen<PlatformBuild
     private void undo() {
         if (undoStack.isEmpty()) return;
         design.clear(); design.putAll(undoStack.pop());
+        designDirty = true;
     }
 
-    // ==================== UTILS ====================
+    // === UTILS ===
 
     private void refreshMaterials() {
-        var handler = menu.blockEntity.getItemHandler();
+        if (getBE() == null) return;
+        var inv = getBE().getItemHandler();
         Set<String> current = new LinkedHashSet<>();
-        for (int i = 0; i < handler.getSlots(); i++) {
-            ItemStack st = handler.getStackInSlot(i);
+        for (int i = 0; i < inv.getSlots(); i++) {
+            ItemStack st = inv.getStackInSlot(i);
             if (!st.isEmpty() && st.getItem() instanceof BlockItem bi) {
-                ResourceLocation id = ForgeRegistries.BLOCKS.getKey(bi.getBlock());
+                ResourceLocation id = BuiltInRegistries.BLOCK.getKey(bi.getBlock());
                 if (id != null) current.add(id.toString());
             }
         }
         for (String m : design.values()) current.add(m);
 
-        // Pig Certificate: add all concrete types to material palette
-        if (menu.blockEntity.hasPigCertificate()) {
-            for (var entry : ForgeRegistries.BLOCKS.getEntries()) {
+        if (getBE().hasPigCertificate()) {
+            for (var entry : BuiltInRegistries.BLOCK.entrySet()) {
                 ResourceLocation id = entry.getKey().location();
                 String idStr = id.toString();
-                if (idStr.endsWith("_concrete")) {
+                if (idStr.endsWith("_concrete") && !idStr.contains("wall") && !idStr.contains("powder")) {
                     current.add(idStr);
                 }
             }
@@ -948,74 +1188,31 @@ public class PlatformBuilderScreen extends AbstractContainerScreen<PlatformBuild
 
         if (current.size() == materials.size() && current.containsAll(materials)) return;
 
-        materials.clear(); matIcons.clear(); matColors.clear();
+        materials.clear(); matSprites.clear(); matIcons.clear(); matColors.clear();
         for (String id : current) {
             materials.add(id);
-            var block = ForgeRegistries.BLOCKS.getValue(new ResourceLocation(id));
+            var block = BuiltInRegistries.BLOCK.get(new ResourceLocation(id));
             if (block != null) {
                 matIcons.put(id, new ItemStack(block.asItem()));
                 matColors.put(id, 0xFF000000 | block.defaultMapColor().col);
+                TextureAtlasSprite sprite = getBlockFaceSprite(block);
+                if (sprite != null) matSprites.put(id, sprite);
             }
         }
     }
 
-    private void copySelection() {
-        clipboard = null;
-        clipboardOrigin = null;
-        if (tool == Tool.RECT && toolStart != null && toolEnd != null) {
-            int mnX = Math.min(toolStart.getX(), toolEnd.getX());
-            int mxX = Math.max(toolStart.getX(), toolEnd.getX());
-            int mnZ = Math.min(toolStart.getZ(), toolEnd.getZ());
-            int mxZ = Math.max(toolStart.getZ(), toolEnd.getZ());
-            clipboard = new LinkedHashMap<>();
-            clipboardOrigin = new BlockPos(mnX, 0, mnZ);
-            for (int x = mnX; x <= mxX; x++) {
-                for (int z = mnZ; z <= mxZ; z++) {
-                    BlockPos p = new BlockPos(x, 0, z);
-                    String mat = design.get(p);
-                    if (mat == null) mat = existingBlocks.get(p);
-                    if (mat != null)
-                        clipboard.put(new BlockPos(x - mnX, 0, z - mnZ), mat);
-                }
-            }
-            clipCenterX = (mxX - mnX) / 2;
-            clipCenterZ = (mxZ - mnZ) / 2;
-        }
-    }
-
-    private void pasteClipboard() {
-        if (clipboard == null || clipboard.isEmpty()) return;
-        BlockPos anchor = toolStart != null ? toolStart : lastClickPos;
-        if (anchor == null) return;
-        saveUndo();
-        for (var entry : clipboard.entrySet()) {
-            BlockPos target = anchor.offset(entry.getKey().getX() - clipCenterX, 0, entry.getKey().getZ() - clipCenterZ);
-            if (!design.containsKey(target))
-                design.put(target, entry.getValue());
-        }
-    }
-
-    private void scanExistingBlocks() {
-        existingBlocks.clear();
-        if (minecraft == null || minecraft.level == null) return;
-
-        BlockPos machinePos = menu.blockEntity.getBlockPos();
-        int offsetY = menu.blockEntity.getBuildOffsetY();
-        int scanY = machinePos.getY() + offsetY;
-        lastScannedOffsetY = offsetY;
-
-        var level = minecraft.level;
-        int range = 48;
-        for (int dx = -range; dx <= range; dx++) {
-            for (int dz = -range; dz <= range; dz++) {
-                var state = level.getBlockState(new BlockPos(machinePos.getX() + dx, scanY, machinePos.getZ() + dz));
-                if (!state.isAir()) {
-                    var id = ForgeRegistries.BLOCKS.getKey(state.getBlock());
-                    if (id != null) {
-                        existingBlocks.put(new BlockPos(dx, 0, dz), id.toString());
-                    }
-                }
-            }
+    /** Get the top-face or representative sprite of a block for flat preview. */
+    private static TextureAtlasSprite getBlockFaceSprite(Block block) {
+        try {
+            var model = Minecraft.getInstance().getBlockRenderer().getBlockModel(block.defaultBlockState());
+            var quads = model.getQuads(block.defaultBlockState(), Direction.UP, RandomSource.create());
+            if (!quads.isEmpty()) return quads.get(0).getSprite();
+            // fallback: try null direction (general quads)
+            quads = model.getQuads(block.defaultBlockState(), null, RandomSource.create());
+            if (!quads.isEmpty()) return quads.get(0).getSprite();
+            return model.getParticleIcon();
+        } catch (Exception e) {
+            return null;
         }
     }
 
@@ -1052,108 +1249,56 @@ public class PlatformBuilderScreen extends AbstractContainerScreen<PlatformBuild
                     case "L↘" -> x == mxX || z == mxZ;
                     case "十字" -> { int cx = (mnX + mxX) / 2, cz = (mnZ + mxZ) / 2; yield (x >= cx - 1 && x <= cx + 2) || (z >= cz - 1 && z <= cz + 2); }
                     case "马路" -> { int cz = (mnZ + mxZ) / 2; yield z >= cz - 1 && z <= cz + 2; }
+                    case "马路竖" -> { int cx = (mnX + mxX) / 2; yield x >= cx - 1 && x <= cx + 2; }
                     default -> new Random().nextBoolean();
                 };
                 design.put(new BlockPos(x, 0, z), useM1 ? m1 : m2);
             }
         }
+        designDirty = true;
     }
 
-    private void aiGenerate() {
-        try {
-            Path cfgPath = Minecraft.getInstance().gameDirectory.toPath().resolve("config/platformbuilder.json");
-            if (!Files.exists(cfgPath)) return;
-            JsonObject cfg = JsonParser.parseString(Files.readString(cfgPath)).getAsJsonObject();
-            String url = cfg.get("api_url").getAsString();
-            String key = cfg.get("api_key").getAsString();
-            String model = cfg.get("model").getAsString();
-
-            int mnX = -5, mxX = 5, mnZ = -5, mxZ = 5;
-            if (tool == Tool.RECT && toolStart != null && toolEnd != null) {
-                mnX = Math.min(toolStart.getX(), toolEnd.getX());
-                mxX = Math.max(toolStart.getX(), toolEnd.getX());
-                mnZ = Math.min(toolStart.getZ(), toolEnd.getZ());
-                mxZ = Math.max(toolStart.getZ(), toolEnd.getZ());
-            }
-
-            StringBuilder mats = new StringBuilder();
-            for (int i = 0; i < Math.min(materials.size(), 20); i++)
-                mats.append(materials.get(i)).append(", ");
-
-            String prompt = String.format(
-                "You are a Minecraft floor pattern generator. Available blocks: [%s]. " +
-                "Generate a creative floor design for area X:%d..%d Z:%d..%d. " +
-                "Output ONLY a JSON object mapping \"x,z\" to block IDs. Example: {\"0,0\":\"minecraft:stone\",\"0,1\":\"minecraft:dirt\"}",
-                mats, mnX, mxX, mnZ, mxZ);
-
-            JsonObject body = new JsonObject();
-            body.addProperty("model", model);
-            var msgs = new com.google.gson.JsonArray();
-            var msg = new JsonObject();
-            msg.addProperty("role", "user");
-            msg.addProperty("content", prompt);
-            msgs.add(msg);
-            body.add("messages", msgs);
-            body.addProperty("temperature", 0.7);
-
-            var client = HttpClient.newHttpClient();
-            var req = HttpRequest.newBuilder()
-                .uri(URI.create(url + "/v1/chat/completions"))
-                .header("Content-Type", "application/json")
-                .header("Authorization", "Bearer " + key)
-                .POST(HttpRequest.BodyPublishers.ofString(body.toString()))
-                .build();
-            var resp = client.send(req, HttpResponse.BodyHandlers.ofString());
-            JsonObject result = JsonParser.parseString(resp.body()).getAsJsonObject();
-            String content = result.getAsJsonArray("choices").get(0)
-                .getAsJsonObject().getAsJsonObject("message").get("content").getAsString();
-            content = content.replaceAll("```json|```", "").trim();
-            JsonObject map = JsonParser.parseString(content).getAsJsonObject();
-
-            saveUndo();
-            for (var entry : map.entrySet()) {
-                String[] parts = entry.getKey().split(",");
-                int x = Integer.parseInt(parts[0].trim());
-                int z = Integer.parseInt(parts[1].trim());
-                BlockPos p = new BlockPos(x, 0, z);
-                if (!design.containsKey(p))
-                    design.put(p, entry.getValue().getAsString());
-            }
-        } catch (Exception ignored) {}
-    }
-
-    private void handlePopupClick(int mx, int my) {
-        int pw = 340, ph = 266;
+    private void handlePopupClick(int mx, int my, int btn) {
+        int pw = 340, ph = 300;
         int px = (width - pw) / 2, py = (height - ph) / 2;
-        if (mx >= px + pw - 20 && mx < px + pw - 4 && my >= py + 4 && my < py + 20) {
+        if (btn == 0 && mx >= px + pw - 20 && mx < px + pw - 4 && my >= py + 4 && my < py + 20) {
             showPatternPopup = false; return;
         }
+        // Material selectors
+        int matCount = Math.max(1, materials.size());
         if (my >= py + 24 && my < py + 44) {
-            if (mx >= px + 27 && mx < px + 49) { popM1Idx = (popM1Idx + 1) % Math.max(1, materials.size()); return; }
-            if (mx >= px + 75 && mx < px + 97) { popM2Idx = (popM2Idx + 1) % Math.max(1, materials.size()); return; }
-        }
-        int rowH = 34, cols = 2;
-        int colW = (pw - 24) / cols;
-        for (int i = 0; i < PATTERN_NAMES.length; i++) {
-            int col = i % cols, row = i / cols;
-            int cx = px + 8 + col * colW;
-            int ry = py + 48 + row * rowH;
-            if (mx >= cx && mx < cx + colW && my >= ry && my < ry + rowH) {
-                selectedPattern = i; return;
+            if (btn == 0) {
+                if (mx >= px + 27 && mx < px + 49) { popM1Idx = (popM1Idx + 1) % matCount; return; }
+                if (mx >= px + 75 && mx < px + 97) { popM2Idx = (popM2Idx + 1) % matCount; return; }
+            } else if (btn == 1) {
+                if (mx >= px + 27 && mx < px + 49) { popM1Idx = (popM1Idx - 1 + matCount) % matCount; return; }
+                if (mx >= px + 75 && mx < px + 97) { popM2Idx = (popM2Idx - 1 + matCount) % matCount; return; }
             }
         }
-        int btnX = px + pw - 50, btnY = py + ph - 24;
-        if (mx >= btnX && mx < btnX + 40 && my >= btnY && my < btnY + 18) {
-            if (selectedPattern >= 0) {
-                generatePatternToClipboard(selectedPattern);
-                mode = Mode.PASTE;
+        if (btn == 0) {
+            int rowH = 34, cols = 2;
+            int colW = (pw - 24) / cols;
+            for (int i = 0; i < PATTERN_NAMES.length; i++) {
+                int col = i % cols, row = i / cols;
+                int cx = px + 8 + col * colW;
+                int ry = py + 48 + row * rowH;
+                if (mx >= cx && mx < cx + colW && my >= ry && my < ry + rowH) {
+                    selectedPattern = i; return;
+                }
             }
-            showPatternPopup = false;
+            int okX = px + pw - 50, okY = py + ph - 24;
+            if (mx >= okX && mx < okX + 40 && my >= okY && my < okY + 18) {
+                if (selectedPattern >= 0) {
+                    generatePatternToClipboard(selectedPattern);
+                    mode = Mode.PASTE;
+                }
+                showPatternPopup = false;
+            }
         }
     }
 
     private void renderPopup(GuiGraphics g) {
-        int pw = 340, ph = 266;
+        int pw = 340, ph = 300;
         int px = (width - pw) / 2, py = (height - ph) / 2;
         g.fill(px, py, px + pw, py + ph, 0xE8202020);
         drawBorder(g, px, py, pw, ph);
@@ -1184,6 +1329,7 @@ public class PlatformBuilderScreen extends AbstractContainerScreen<PlatformBuild
             int ry = py + 48 + row * rowH;
             if (i == selectedPattern)
                 g.fill(cx - 2, ry - 2, cx + colW - 4, ry + rowH - 2, 0x40FFFFFF);
+
             String name = PATTERN_NAMES[i];
             for (int x = 0; x < 16; x++) {
                 for (int z = 0; z < 16; z++) {
@@ -1198,6 +1344,7 @@ public class PlatformBuilderScreen extends AbstractContainerScreen<PlatformBuild
                         case "L↘" -> x == 15 || z == 15;
                         case "十字" -> (x >= 6 && x <= 9) || (z >= 6 && z <= 9);
                         case "马路" -> z >= 6 && z <= 9;
+                        case "马路竖" -> x >= 6 && x <= 9;
                         default -> (x * 7 + z * 13) % 3 != 0;
                     };
                     g.fill(cx + x * cellSz, ry + 2 + z * cellSz,
@@ -1215,27 +1362,6 @@ public class PlatformBuilderScreen extends AbstractContainerScreen<PlatformBuild
         int btnX = px + pw - 50, btnY = py + ph - 24;
         g.fill(btnX, btnY, btnX + 40, btnY + 18, 0xFF446644);
         g.drawCenteredString(font, Component.literal("确定"), btnX + 20, btnY + 5, 0xFFFFFFFF);
-    }
-
-    private void doReplace(String to) {
-        if (replaceFrom == null || replaceFrom.equals(to)) return;
-        saveUndo();
-        int mnX = Integer.MIN_VALUE, mxX = Integer.MAX_VALUE;
-        int mnZ = Integer.MIN_VALUE, mxZ = Integer.MAX_VALUE;
-        if (tool == Tool.RECT && toolStart != null && toolEnd != null) {
-            mnX = Math.min(toolStart.getX(), toolEnd.getX());
-            mxX = Math.max(toolStart.getX(), toolEnd.getX());
-            mnZ = Math.min(toolStart.getZ(), toolEnd.getZ());
-            mxZ = Math.max(toolStart.getZ(), toolEnd.getZ());
-        }
-        var toChange = new ArrayList<BlockPos>();
-        for (var e : design.entrySet()) {
-            BlockPos p = e.getKey();
-            if (e.getValue().equals(replaceFrom)
-                && p.getX() >= mnX && p.getX() <= mxX && p.getZ() >= mnZ && p.getZ() <= mxZ)
-                toChange.add(p);
-        }
-        for (BlockPos p : toChange) design.put(p, to);
     }
 
     private void generatePatternToClipboard(int idx) {
@@ -1267,6 +1393,7 @@ public class PlatformBuilderScreen extends AbstractContainerScreen<PlatformBuild
                     case "L↘" -> x == mxX || z == mxZ;
                     case "十字" -> { int cx = (mnX + mxX) / 2, cz = (mnZ + mxZ) / 2; yield (x >= cx - 1 && x <= cx + 2) || (z >= cz - 1 && z <= cz + 2); }
                     case "马路" -> { int cz = (mnZ + mxZ) / 2; yield z >= cz - 1 && z <= cz + 2; }
+                    case "马路竖" -> { int cx = (mnX + mxX) / 2; yield x >= cx - 1 && x <= cx + 2; }
                     default -> new Random().nextBoolean();
                 };
                 clipboard.put(new BlockPos(x - mnX, 0, z - mnZ), useM1 ? m1 : m2);
@@ -1303,14 +1430,37 @@ public class PlatformBuilderScreen extends AbstractContainerScreen<PlatformBuild
         g.fill(x1, y, x2, y + 1, color);
     }
 
-    // ==================== NETWORK ====================
+    // === NETWORK ===
 
     private void sendDesign() {
-        ModMessages.sendToServer(new SyncDesignPacket(menu.blockEntity.getBlockPos(), new HashMap<>(design)));
+        ModMessages.sendToServer(new SyncDesignPacket(getBEPos(), new HashMap<>(design)));
     }
 
-    @Override
-    public void onClose() { sendDesign(); super.onClose(); }
+    private PlatformBuilderBlockEntity getBE() {
+        return menu.blockEntity;
+    }
+
+    private BlockPos getBEPos() {
+        return getBE() != null ? getBE().getBlockPos() : BlockPos.ZERO;
+    }
+
+    private int getBuildSpeed() {
+        return getBE() != null ? getBE().getBuildSpeed() : 50;
+    }
+
+    private void setBuildSpeed(int speed) {
+        if (getBE() != null) getBE().setBuildSpeed(speed);
+    }
+
+    private int getBuildOffsetY() {
+        return getBE() != null ? getBE().getBuildOffsetY() : 0;
+    }
+
+    private void setBuildOffsetY(int offset) {
+        if (getBE() != null) getBE().setBuildOffsetY(offset);
+    }
+
+    public void onClose() { if (designDirty) sendDesign(); super.onClose(); }
 
     public void updateDesign(Map<BlockPos, String> d) {
         design.clear(); if (d != null) design.putAll(d);

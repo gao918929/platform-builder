@@ -107,6 +107,7 @@ public class PlatformBuilderBlockEntity extends BlockEntity implements MenuProvi
         buildQueue.clear();
         design.entrySet().stream()
                 .sorted(Comparator.comparingInt(e -> e.getKey().distManhattan(BlockPos.ZERO)))
+                .map(e -> Map.entry(e.getKey(), e.getValue()))
                 .forEach(buildQueue::add);
 
         isBuilding = true;
@@ -215,7 +216,7 @@ public class PlatformBuilderBlockEntity extends BlockEntity implements MenuProvi
     }
 
     private static boolean isConcrete(String blockId) {
-        return blockId.endsWith("_concrete");
+        return blockId.endsWith("_concrete") && !blockId.contains("wall") && !blockId.contains("powder");
     }
 
     private int findMaterialSlot(Block block) {
@@ -313,6 +314,7 @@ public class PlatformBuilderBlockEntity extends BlockEntity implements MenuProvi
     public CompoundTag getUpdateTag(HolderLookup.Provider registries) {
         CompoundTag tag = super.getUpdateTag(registries);
         saveDesign(tag);
+        tag.putBoolean("isBuilding", isBuilding);
         tag.putInt("buildSpeed", buildSpeed);
         tag.putInt("buildOffsetY", buildOffsetY);
         return tag;
@@ -322,6 +324,7 @@ public class PlatformBuilderBlockEntity extends BlockEntity implements MenuProvi
     public void handleUpdateTag(CompoundTag tag, HolderLookup.Provider registries) {
         super.handleUpdateTag(tag, registries);
         loadDesign(tag);
+        isBuilding = tag.getBoolean("isBuilding");
         buildSpeed = tag.contains("buildSpeed") ? tag.getInt("buildSpeed") : 50;
         buildOffsetY = tag.contains("buildOffsetY") ? tag.getInt("buildOffsetY") : 0;
     }
